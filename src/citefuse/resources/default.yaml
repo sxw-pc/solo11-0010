@@ -1,0 +1,82 @@
+# citefuse default configuration
+# All values are deterministic. Edit + rerun; the SHA-256 of this document is
+# recorded on every pipeline run so a result can always be reproduced.
+version: 1
+
+normalization:
+  # NFKC folds full-width Latin letters and punctuation to ASCII.
+  unicode_form: NFKC
+  casefold: true
+  strip_punctuation: true
+  # Author strings may be "Family, Given" or "Given Family"; comma form wins.
+  author_formats: [family_given, given_family]
+  # Removed before building title signatures (blocking only, not scoring).
+  title_stopwords:
+    ["a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "of",
+     "on", "or", "the", "to", "under", "via", "with", "study", "studies",
+     "analysis", "evidence", "synthesis"]
+  # Fictional venue aliases. The key is the canonical normalized venue name.
+  venue_aliases:
+    Journal of Fictional Evidence Synthesis:
+      [J. Fict. Evid. Synth., JFES, Journal of Fictional Evidence Synthesis (JFES)]
+    Imaginary Research Methods Quarterly:
+      [Imag. Res. Methods Q., IRMQ, Imaginary Research Methods Q.]
+    Proceedings of the Synthetic Evidence Conference:
+      [Proc. Synth. Evid. Conf., PSEC, Synthetic Evidence Conference Proceedings]
+    Annals of Invented Public Health:
+      [Ann. Invented Public Health, AI Pure Health, Annals of Invented Public Hlth.]
+    Fabricated Clinical Trials Review:
+      [Fabr. Clin. Trials Rev., FCTR, Fabricated Clinical Trial Review]
+
+blocking:
+  # Each strategy can be disabled independently. The final candidate set is the
+  # union; all strategies are O(n^2) inside a bucket and suitable for local use.
+  year_venue:
+    enabled: true
+    venue_prefix_len: 5
+  title_signature:
+    enabled: true
+    token_count: 5
+    min_token_length: 2
+  author_year:
+    enabled: true
+
+scoring:
+  # Weights need not sum to one; the final score is normalized by effective
+  # weight. DOI is intentionally strong but cannot alone exceed the match
+  # threshold.
+  weights:
+    title: 0.38
+    authors: 0.18
+    venue: 0.10
+    year: 0.10
+    pages: 0.06
+    doi: 0.18
+  # "neutral" gives a missing field a fixed score and keeps its weight.
+  # "exclude" drops the field and renormalizes over present fields.
+  missing_policy: neutral
+  neutral_score: 0.50
+  # Score by absolute year difference: exact, 1 year, 2 years, then zero.
+  year_diff_scores: [1.0, 0.75, 0.40]
+  review_low: 0.68
+  match_threshold: 0.80
+
+survivorship:
+  # Supported rules: longest, most_frequent, min_year, source_priority,
+  # non_null_concat. Ties are resolved by source priority, then record key.
+  title: longest
+  authors: non_null_concat
+  venue: most_frequent
+  year: min_year
+  volume: non_null_concat
+  issue: non_null_concat
+  pages: longest
+  doi: source_priority
+  # Earlier entries win. Must cover every source in an imported batch for a
+  # fully explained golden record; unknown sources sort last.
+  source_priority: [ORBIT, LANTERN, MEADOW, COMPASS]
+
+review:
+  # Unresolved pairs in [review_low, match_threshold) are available to reviewers.
+  default_page_size: 10
+  max_page_size: 100

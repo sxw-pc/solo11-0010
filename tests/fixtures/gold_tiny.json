@@ -1,0 +1,28 @@
+{
+  "clusters": {
+    "T1": [
+      "LANTERN::T002",
+      "MEADOW::T003",
+      "ORBIT::T001"
+    ],
+    "T2": [
+      "COMPASS::T004"
+    ],
+    "U1": [
+      "ORBIT::T005"
+    ],
+    "U2": [
+      "LANTERN::T006"
+    ]
+  },
+  "gold_cluster_count": 4,
+  "labels": {
+    "COMPASS::T004": "T2",
+    "LANTERN::T002": "T1",
+    "LANTERN::T006": "U2",
+    "MEADOW::T003": "T1",
+    "ORBIT::T001": "T1",
+    "ORBIT::T005": "U1"
+  },
+  "record_count": 6
+}
