@@ -84,6 +84,8 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `survivorship.*` | 见下节 | 字段级金记录规则。 |
 | `source_priority` | ORBIT > LANTERN > MEADOW > COMPASS | 并列时的确定性来源优先级，未列出的来源排最后。 |
 | `review.default_page_size` / `max_page_size` | 10 / 100 | 复核队列默认与上限。 |
+| `source_quality.bad_row_rate_threshold` | `0.10` | 来源坏行占比超过此值（严格大于）时标记 `high_bad_row_rate`。 |
+| `source_quality.overturn_rate_threshold` | `0.20` | 来源人工推翻率超过此值（严格大于）时标记 `high_overturn_rate`。 |
 
 ## 4. 数据模型（SQLite）
 
@@ -91,13 +93,14 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 |---|---|---|
 | `batches` | `batch_id`, `input_hash`, `total_lines`, `valid_lines`, `bad_lines` | 批次及统计；重复内容由 `input_hash` 识别。 |
 | `records` | `record_pk`, `(batch_id,source,record_id) UNIQUE`, `raw_json`, `norm_json`, 各归一列 | 原始值与归一值双份保存。 |
-| `dead_letters` | `line_no`, `reason`, `raw_text` | 逐行校验失败，不阻断整批。 |
+| `dead_letters` | `line_no`, `reason`, `raw_text`, `source` | 逐行校验失败，不阻断整批；`source` 为从原始行尽力解析出的来源，无法解析时为 `NULL`。 |
 | `runs` | `run_id`, `config_hash`, 各计数, `timings_json`, `blocking_stats_json`, `status` | 一次逻辑运行的可复现快照。 |
 | `run_attempts` | 与 `runs` 相同计数 + `started_at`, `finished_at` | 每次实际调用都追加一条审计尝试记录。 |
 | `pairs` | `pair_key`, 两记录主键, `score`, `zone`, `details_json` | 所有候选对的总分与分项得分明细。 |
 | `edges` | `pair_key`, `kind=model/human_same`, `score` | 实际参与聚类的匹配边。 |
 | `clusters` | `cluster_id`, `member_keys_json`, `golden_json` | 簇成员与字段级金记录。 |
 | `decisions` | `pair_key`, `decision`, `reviewer`, `note`, `submitted_at` | 人工裁定历史；同 pair 以提交时间/自增序号最新者为准。 |
+| `source_quality` | `(run_id,source) PK`, 各计数与四个比率, `computed_at` | 每次运行结束按来源生成的画像行；重算以 REPLACE 覆盖。 |
 | `audit_events` | `run_id`, `event_type`, `detail_json`, `created_at` | 复核冲突、运行完成/失败等审计事件。 |
 
 `run_id` 由批次内容哈希、配置哈希和裁定历史确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。
@@ -123,6 +126,7 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | GET | `/review/decisions` | `?batch_id=` | 裁定历史。 |
 | GET | `/metrics/report` | `?run_id=` | pairwise P/R/F1、簇完全一致率；写 `data/reports/{run_id}.json`。 |
 | GET | `/metrics/thresholds` | `?run_id=&grid=0.5,0.6,...` | 复用已落库分数做阈值扫描，不重跑归一化/阻塞；写扫描报告。 |
+| GET | `/quality/sources` | `?run_id=` 或 `?batch_id=`（`scope=run`，默认）；或 `?batch_id=`/无参数（`scope=cumulative`） | 来源级质量画像：单期值或跨运行累计值，含异常标记。 |
 | GET | `/clusters` | `?run_id=` 或 `?batch_id=` | 簇摘要与金记录。 |
 | GET | `/clusters/{cluster_id}` | `?run_id=`/`batch_id=` | 成员原始+归一数据、金记录、边明细与分项得分。 |
 | GET | `/golden/export` | `?format=jsonl\|csv&run_id=` | 确定性金记录导出（Content-Disposition 文件下载）。 |
@@ -203,6 +207,30 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 
 金记录保存 `member_count` 与每字段 `provenance`（入选来源记录 key）。所有并列都用来源优先级 → 记录 key 解决。
 
+### 来源质量画像
+
+每次管道运行结束（`status=completed`）自动生成 `source_quality` 行，按来源聚合四项指标：
+
+| 指标 | 分子 / 分母 | 说明 |
+|---|---|---|
+| 坏行占比 | 归属该来源的死信行 / 该来源尝试行数 | 尝试行数 = 本次运行聚类的该来源记录数 + 归属该来源的死信行数。 |
+| 单例率 | 本次运行中该来源的簇内独居记录数 / 该来源记录数 | 以本次运行的 clusters 为准，不受批次后来重新导入影响。 |
+| 候选对平均分 | 该来源参与的候选对分值之和 / 候选对数 | 一对跨两个来源时两个来源各计一次；同来源对内只计一次。 |
+| 人工推翻率 | 该来源参与且被推翻的已裁定 pair 数 / 该来源参与的已裁定 pair 数 | 模型判匹配人工判不同、模型判不同人工判匹配都算推翻；跨来源 pair 两边都计。只统计本次运行里存在且人工已裁定的 pair，同 pair 取最新裁定。 |
+
+死信的来源归属是尽力而为：原始行能解析出非空字符串 `source` 时归到该来源（转大写，与有效记录一致）；整行 JSON 损坏或缺少 `source` 时记为 `NULL`，只计入 run 级 `bad_rows`，不摊到任何来源头上。
+
+**零分母**：分母为 0 的比率存 `NULL`，接口序列化为 JSON `null`，且不参与阈值判定——没有候选对或没有裁定不等于「零缺陷」。
+
+**异常标记**：返回中每行带 `anomalous` 与 `anomaly_flags`（`high_bad_row_rate` / `high_overturn_rate`）。比率**严格大于**配置阈值才标记，等于阈值视为健康；比率为 `NULL` 时不标记。
+
+**单期与累计**：
+
+- `scope=run`：某次运行自己的值，来源按名称升序，顺序确定。
+- `scope=cumulative`：跨运行累计，**按分母加权**而非对运行比率简单平均。把各运行的分子分母分别求和后再算比率，得到的是把全部记录合在一起手工核算会得到的值；简单平均会让只有 3 条记录的小运行和 3000 条记录的大运行等权，且分母为 0 的运行无法定义。**被后续重跑取代的旧运行不计入**：每次重跑都会用当前裁定历史重算整条管道，旧 run 是同一批记录的过期快照，计入会重复计数并让复核前的快照稀释复核后的结论。累计按「每批次取最新一条 completed run」聚合；`runs_included`、`batches_included` 和 `superseded_runs`（被排除的旧运行数）都显式返回。累计可按 `batch_id` 限定到单批次。
+
+**幂等**：画像以 `(run_id, source)` 为主键，每次计算先删该 run 的旧行再整体写入，同一运行重复触发只会覆盖，不会追加重复行。管道运行本身会把裁定历史快照显式传入，因此历史运行保留自己的裁定视角，后续复核不会改写旧运行画像。旧数据库启动时自动 `ALTER TABLE` 补 `dead_letters.source` 列，缺画像的已完成运行在首次查询时惰性补算。
+
 ## 7. 幂等、确定性与审计
 
 - 同一批次重复导入：内容哈希相同直接返回原批次，`inserted=0`；`(batch_id, source, record_id)` 唯一约束兜底。
@@ -252,9 +280,11 @@ curl -s -X POST 'http://127.0.0.1:8321/review/decisions' \
   -H 'Content-Type: application/json' \
   -d '{"batch_id":"DEMO","pair_key":"PAIR_KEY_HERE","decision":"different","reviewer":"reviewer-1","note":"different trial"}'
 
-# 指标、阈值扫描、导出
+# 指标、阈值扫描、来源画像、导出
 curl -s "http://127.0.0.1:8321/metrics/report?run_id=$RUN"
 curl -s "http://127.0.0.1:8321/metrics/thresholds?run_id=$RUN&grid=0.60,0.70,0.80,0.90"
+curl -s "http://127.0.0.1:8321/quality/sources?run_id=$RUN"
+curl -s "http://127.0.0.1:8321/quality/sources?scope=cumulative"
 curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/golden.jsonl
 curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=csv" -o data/golden.csv
 

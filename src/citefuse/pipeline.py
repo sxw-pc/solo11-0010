@@ -11,6 +11,7 @@ from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
 from .models import Record, record_from_db
+from .quality import compute_source_quality
 from .review import decision_dicts
 from .scoring import score_pair
 from .storage import Storage
@@ -132,6 +133,12 @@ def run_pipeline(
         storage.replace_edges(run_id, applied_edges)
         storage.replace_clusters(run_id, batch_id, cluster_rows)
         mark("persistence")
+        # Source profiles are derived from the persisted pairs/clusters and the
+        # exact decision history used by this run, so a historical run keeps its
+        # own snapshot even after later reviews. Rewriting by (run_id, source)
+        # makes recomputation idempotent.
+        compute_source_quality(storage, config, clock, run_id, decisions=history)
+        mark("quality")
         timings["total"] = round(clock.monotonic() - start, 6)
         storage.save_run(run_common)
         for conflict in conflicts:

@@ -23,6 +23,7 @@ from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
 from .models import DecisionRequest, RunRequest
 from .pipeline import run_pipeline
+from .quality import SourceQualityError, cumulative_quality_report, run_quality_report
 from .review import decision_dicts, next_review_pairs, submit_decision
 from .storage import Storage
 
@@ -193,6 +194,30 @@ def create_app(
         if storage.get_batch(batch_id) is None:
             raise HTTPException(404, f"batch {batch_id!r} not found")
         return [dict(row) for row in decision_dicts(storage, batch_id)]
+
+    @app.get("/quality/sources")
+    def quality_sources(
+        run_id: str | None = None,
+        batch_id: str | None = None,
+        scope: str = Query(default="run"),
+    ) -> dict[str, Any]:
+        if scope not in {"run", "cumulative"}:
+            raise HTTPException(400, "scope must be 'run' or 'cumulative'")
+        if scope == "cumulative":
+            if run_id is not None:
+                raise HTTPException(
+                    400, "run_id is not valid for scope=cumulative; use batch_id"
+                )
+            if batch_id is not None and storage.get_batch(batch_id) is None:
+                raise HTTPException(404, f"batch {batch_id!r} not found")
+            return cumulative_quality_report(storage, config, active_clock, batch_id)
+        try:
+            resolved = _resolve_run(storage, run_id, batch_id)
+            return run_quality_report(storage, config, active_clock, resolved)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except SourceQualityError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/metrics/report")
     def metrics_report(run_id: str) -> dict[str, Any]:

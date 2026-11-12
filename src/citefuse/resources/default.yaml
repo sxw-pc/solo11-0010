@@ -80,3 +80,12 @@ review:
   # Unresolved pairs in [review_low, match_threshold) are available to reviewers.
   default_page_size: 10
   max_page_size: 100
+
+source_quality:
+  # A source is flagged in the quality-profile API when its ratio is strictly
+  # greater than the threshold (the boundary value itself is healthy).
+  # bad_row_rate = that source's dead-letter lines / that source's attempted lines.
+  # overturn_rate = human-ruled candidate pairs involving the source that were
+  # overturned / all human-ruled candidate pairs involving the source.
+  bad_row_rate_threshold: 0.10
+  overturn_rate_threshold: 0.20

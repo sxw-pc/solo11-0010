@@ -40,6 +40,22 @@ def _validation_reason(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:500]
 
 
+def _dead_letter_source(line: str, parsed: Any) -> str | None:
+    """Best-effort source attribution for a dead letter.
+
+    A line can fail before or after JSON parsing. When a parsed object carries a
+    non-empty string ``source``, that value is attributed (upper-cased, matching
+    how valid records normalize their source). Otherwise the line is source-
+    unknown and only counts toward the run-level bad-row total, never toward a
+    source's bad-row rate.
+    """
+    if isinstance(parsed, dict):
+        value = parsed.get("source")
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return None
+
+
 def ingest_jsonl(
     storage: Storage,
     config: AppConfig,
@@ -99,6 +115,7 @@ def ingest_jsonl(
         if not line.strip():
             continue
         physical_lines += 1
+        parsed: Any = None
         try:
             parsed = json.loads(line)
             if not isinstance(parsed, dict):
@@ -106,7 +123,10 @@ def ingest_jsonl(
             raw = RawRecord.model_validate(parsed)
             norm = normalizer.normalize(raw)
         except (json.JSONDecodeError, ValidationError, ValueError, NormalizationError) as exc:
-            storage.insert_dead_letter(chosen_id, line_no, _validation_reason(exc), line)
+            storage.insert_dead_letter(
+                chosen_id, line_no, _validation_reason(exc), line,
+                _dead_letter_source(line, parsed),
+            )
             dead_added += 1
             continue
 

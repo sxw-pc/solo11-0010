@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS dead_letters (
   dead_id INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
   line_no INTEGER NOT NULL, reason TEXT NOT NULL, raw_text TEXT NOT NULL,
+  -- Best-effort source attribution parsed from the raw line. NULL when the
+  -- line is not valid JSON or has no usable "source" field.
+  source TEXT,
   UNIQUE(batch_id, line_no, reason, raw_text)
 );
 CREATE TABLE IF NOT EXISTS runs (
@@ -87,6 +90,28 @@ CREATE TABLE IF NOT EXISTS decisions (
   submitted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_batch ON decisions(batch_id, pair_key);
+CREATE TABLE IF NOT EXISTS source_quality (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  -- Counts are kept next to the ratios so a cumulative profile can pool
+  -- numerators/denominators instead of averaging run-level ratios.
+  attempted_lines INTEGER NOT NULL,
+  bad_lines INTEGER NOT NULL,
+  record_count INTEGER NOT NULL,
+  singleton_count INTEGER NOT NULL,
+  candidate_pairs INTEGER NOT NULL,
+  candidate_score_sum REAL NOT NULL,
+  decided_pairs INTEGER NOT NULL,
+  overturned_pairs INTEGER NOT NULL,
+  -- NULL when the denominator is zero: an undefined rate is not a zero rate.
+  bad_row_rate REAL,
+  singleton_rate REAL,
+  avg_candidate_score REAL,
+  overturn_rate REAL,
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY(run_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_source_quality_run ON source_quality(run_id);
 CREATE TABLE IF NOT EXISTS audit_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT, batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -112,6 +137,16 @@ class Storage(RepositoryMixin):
         self.conn.execute("PRAGMA journal_mode=WAL")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Apply additive migrations to databases created by older versions."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(dead_letters)")
+        }
+        if "source" not in columns:
+            conn.execute("ALTER TABLE dead_letters ADD COLUMN source TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -183,11 +218,13 @@ class Storage(RepositoryMixin):
         row = self.query_one("SELECT COUNT(*) AS n FROM records WHERE batch_id=?", (batch_id,))
         return int(row["n"]) if row else 0
 
-    def insert_dead_letter(self, batch_id: str, line_no: int, reason: str, raw: str) -> None:
+    def insert_dead_letter(
+        self, batch_id: str, line_no: int, reason: str, raw: str, source: str | None
+    ) -> None:
         self.execute(
-            """INSERT OR IGNORE INTO dead_letters(batch_id,line_no,reason,raw_text)
-               VALUES(?,?,?,?)""",
-            (batch_id, line_no, reason, raw),
+            """INSERT OR IGNORE INTO dead_letters(batch_id,line_no,reason,raw_text,source)
+               VALUES(?,?,?,?,?)""",
+            (batch_id, line_no, reason, raw, source),
         )
 
     def count_dead_letters(self, batch_id: str) -> int:
@@ -196,9 +233,16 @@ class Storage(RepositoryMixin):
         )
         return int(row["n"]) if row else 0
 
-    def list_dead_letters(self, batch_id: str, limit: int = 100) -> list[sqlite3.Row]:
+    def list_dead_letters(
+        self, batch_id: str, limit: int | None = 100
+    ) -> list[sqlite3.Row]:
+        if limit is None:
+            return self.query(
+                "SELECT * FROM dead_letters WHERE batch_id=?"
+                " ORDER BY line_no,dead_id", (batch_id,),
+            )
         return self.query(
-            "SELECT * FROM dead_letters WHERE batch_id=? ORDER BY line_no LIMIT ?",
+            "SELECT * FROM dead_letters WHERE batch_id=? ORDER BY line_no,dead_id LIMIT ?",
             (batch_id, limit),
         )
 

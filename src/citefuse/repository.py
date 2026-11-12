@@ -167,3 +167,33 @@ class RepositoryMixin:
             "SELECT * FROM decisions WHERE batch_id=? ORDER BY submitted_at,decision_id",
             (batch_id,),
         )
+
+    # -- source quality profiles ---------------------------------------------
+    def replace_source_quality(self, run_id: str, rows: list[dict[str, Any]]) -> None:
+        """Overwrite this run's profile atomically (idempotent on rerun)."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM source_quality WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO source_quality(run_id,source,attempted_lines,bad_lines,
+                     record_count,singleton_count,candidate_pairs,candidate_score_sum,
+                     decided_pairs,overturned_pairs,bad_row_rate,singleton_rate,
+                     avg_candidate_score,overturn_rate,computed_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (run_id, row["source"], row["attempted_lines"], row["bad_lines"],
+                     row["record_count"], row["singleton_count"],
+                     row["candidate_pairs"], row["candidate_score_sum"],
+                     row["decided_pairs"], row["overturned_pairs"],
+                     row["bad_row_rate"], row["singleton_rate"],
+                     row["avg_candidate_score"], row["overturn_rate"],
+                     row["computed_at"])
+                    for row in rows
+                ],
+            )
+
+    def list_source_quality(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row) for row in self.query(
+                "SELECT * FROM source_quality WHERE run_id=? ORDER BY source", (run_id,)
+            )
+        ]

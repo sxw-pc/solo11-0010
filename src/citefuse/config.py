@@ -106,6 +106,18 @@ class ReviewConfig(_Strict):
     max_page_size: int = Field(default=100, ge=1, le=1000)
 
 
+class SourceQualityConfig(_Strict):
+    """Thresholds that flag an unhealthy source in the quality API.
+
+    A source is flagged when its observed ratio is *strictly greater* than the
+    configured threshold, so the boundary value itself stays healthy. Both
+    thresholds operate on ratios in [0, 1].
+    """
+
+    bad_row_rate_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
+    overturn_rate_threshold: float = Field(default=0.20, ge=0.0, le=1.0)
+
+
 class SurvivorshipConfig(_Strict):
     title: str = "longest"
     authors: str = "non_null_concat"
@@ -138,6 +150,7 @@ class AppConfig(_Strict):
     scoring: ScoringConfig
     survivorship: SurvivorshipConfig = SurvivorshipConfig()
     review: ReviewConfig = ReviewConfig()
+    source_quality: SourceQualityConfig = SourceQualityConfig()
 
     def canonical_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
