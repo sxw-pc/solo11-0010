@@ -212,7 +212,78 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 配置 SHA-256 写入 `runs.config_hash` 和指标报告；报告位于 `data/reports/{run_id}.json` 与 `{run_id}_thresholds.json`。
 - 指标：pairwise TP/FP/FN 基于金标准簇；簇级完全一致率 = 与某个金标准簇成员集合完全相同的预测簇数 / 有金标签的预测簇数。阈值扫描仅复用 `pairs.score`，不重跑归一化或阻塞。
 
-## 8. 已知局限
+## 8. 增量融合（add-on 模块 `citefuse.incremental`）
+
+全量管道的代码路径保持不变；增量能力完全由独立子包 `citefuse.incremental`
+提供，只**读取**历史 run 并**追加**新 run，从不修改任何历史快照。
+
+### 8.1 能力与保证
+
+- **仅处理新增题录**：以某个已完成 run 为基线（默认取批次最新 run），自动
+  识别基线簇之外的新记录；新-新配对走原有阻塞器，新-旧配对通过分页流式扫描
+  历史记录生成，旧-旧配对直接复用基线落库结果。
+- **与全量重跑逐项一致**：阻塞、打分、聚类、金记录全部复用未改动的全量算法
+  函数；增量 run 的 `run_id` 沿用全量确定性派生公式，因此对「旧数据+新数据」
+  做一次全量重跑会得到**相同的 run_id、pairs、edges、clusters、golden**。
+- **历史快照不可变**：基线及更早 run 的 `pairs/edges/clusters` 一行不改，写入
+  后还会做漂移校验；每个 run 仍可独立复现。
+- **失败整体回滚**：一次增量任务的所有业务写入在单个 SQLite 事务内提交，
+  校验失败、匹配异常等任何错误都会回滚全部业务写入；仅在独立的
+  `incremental_tasks` 表保留 `failed` 任务行并写 `incremental_failed` 审计事件。
+- **内存有界**：历史记录按 `page_size`（默认 256）键集分页扫描，历史 pair 行
+  通过服务端 `INSERT ... SELECT` 复制，Python 侧从不一次性加载全部历史。
+- **串行提交隔离**：进程内线程锁 + 单行数据库锁（`incremental_locks` 的
+  UNIQUE 约束，跨进程生效），并发提交第二个任务直接返回 `409`。
+- **人工判定优先级不变**：聚类仍由原 `cluster_records` 基于实时裁定历史执行，
+  `same` 强制连边、`different` 禁连边、新裁定胜出等规则与全量完全一致。
+- **统计口径对齐**：增量 run 的 `runs` 行使用与全量完全相同的计数器口径
+  （`input_rows/candidate_pairs/matched_edges/cluster_count/...`），阻塞策略
+  计数为「基线旧-旧计数 + 本次增量计数」；增量专属的增量计数（new/reused）
+  单独存放在 `incremental_tasks`。
+
+### 8.2 新增存储对象（幂等建表，不改动既有表）
+
+| 表 | 用途 |
+|---|---|
+| `incremental_tasks` | 每次增量任务一行：可复现 `task_id`（`incr_` 前缀）、基线 run、产出 run、状态、增量计数、耗时、阻塞统计、错误信息。 |
+| `incremental_locks` | 单行串行任务锁，UNIQUE 约束保证跨进程互斥。 |
+
+### 8.3 API 与调用
+
+```bash
+# 对批次 B 的最新 run 做增量融合（必须先存在至少一个已完成的全量/增量 run）
+curl -s -X POST http://127.0.0.1:8321/incremental/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B"}'
+# 显式指定基线 run
+curl -s -X POST http://127.0.0.1:8321/incremental/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B","base_run_id":"run_xxxx"}'
+# 任务查询
+curl -s 'http://127.0.0.1:8321/incremental/tasks?batch_id=B'
+curl -s 'http://127.0.0.1:8321/incremental/tasks/incr_xxxx'
+```
+
+Python 侧入口：
+
+```python
+from citefuse.incremental import run_incremental, IncrementalError, IncrementalBusy
+result = run_incremental(storage, config, clock, "B")          # 基线默认最新 run
+result = run_incremental(storage, config, clock, "B", base_run_id="run_...")
+```
+
+行为约定：
+
+- 无基线 run、基线不存在/不属于该批次/状态非 completed、当前配置哈希与基线
+  不一致（配置漂移）都会拒绝执行并触发回滚语义（HTTP 400/404）。
+- 没有新记录且裁定历史未变化时返回 `noop` 结果，不产生新的业务 run。
+- 相同输入重复提交是幂等的：返回同一 `run_id` 且标记 `idempotent_replay`，
+  不重复追加 `run_attempts`。
+- 增量产出的 run 可直接用于既有所有只读接口：`/clusters`、
+  `/clusters/{id}`、`/golden/export`、`/metrics/report`、
+  `/metrics/thresholds`、`/review/next`。
+
+## 9. 已知局限
 
 - 归一化在导入时完成；修改 `normalization` 配置后需重新导入批次（幂等以内容哈希为准）。
 - 单进程 SQLite，适合本地中小规模批次；阻塞桶内最坏 O(n²)，不做分布式/增量流式处理。
@@ -221,7 +292,7 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 金记录字段为归一化后的值；原始值保留在簇成员的 `raw_json` 中。
 - 复核裁定接口同步自动重跑，超大批次时请求耗时随管道耗时增长。
 
-## 9. 测试与验收走查
+## 10. 测试与验收走查
 
 ```bash
 # 安装

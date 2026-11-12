@@ -20,6 +20,7 @@ from .audit import run_events
 from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
 from .ingest import IngestError, ingest_jsonl
+from .incremental.api import register_incremental_routes
 from .metrics import MetricsError, build_report, scan_thresholds
 from .models import DecisionRequest, RunRequest
 from .pipeline import run_pipeline
@@ -88,6 +89,9 @@ def create_app(
         storage.close()
 
     app = FastAPI(title="citefuse", version="0.1.0", lifespan=lifespan)
+
+    # Add-on incremental routes; the full-run routes below are unchanged.
+    register_incremental_routes(app, storage, config, active_clock)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
