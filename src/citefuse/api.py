@@ -16,12 +16,14 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from .api_views import (
     batch_public, cluster_detail, cluster_summaries, export_golden, run_public,
 )
-from .audit import run_events
+from .audit import record_event, run_events
 from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
+from .drift.guard import DriftGuard
+from .drift.store import DriftStore
 from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
-from .models import DecisionRequest, RunRequest
+from .models import DecisionRequest, RunRequest, record_from_db
 from .pipeline import run_pipeline
 from .review import decision_dicts, next_review_pairs, submit_decision
 from .storage import Storage
@@ -49,7 +51,7 @@ def _pipeline_public(result: dict[str, Any]) -> dict[str, Any]:
     keys = [
         "run_id", "batch_id", "config_hash", "input_rows", "bad_rows",
         "candidate_pairs", "matched_edges", "cluster_count", "golden_count",
-        "timings", "blocking_stats", "status", "conflicts",
+        "timings", "blocking_stats", "drift_summary", "status", "conflicts",
     ]
     return {key: result.get(key) for key in keys}
 
@@ -252,5 +254,63 @@ def create_app(
             media_type=media_type,
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    # -- semantic drift guard -------------------------------------------------
+    @app.get("/drift/quarantine")
+    def drift_quarantine(batch_id: str | None = None) -> dict[str, Any]:
+        drift_store = DriftStore(storage)
+        items = drift_store.list_quarantine(batch_id)
+        return {"count": len(items), "items": items}
+
+    @app.get("/drift/dispositions")
+    def drift_dispositions(
+        batch_id: str,
+        tier: str | None = Query(default=None),
+        n: int = Query(default=100, ge=1, le=5000),
+    ) -> dict[str, Any]:
+        if storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        if tier is not None and tier not in ("clean", "minor", "medium", "heavy"):
+            raise HTTPException(400, "tier must be one of clean/minor/medium/heavy")
+        drift_store = DriftStore(storage)
+        items = drift_store.list_dispositions(batch_id, tier, n)
+        return {"batch_id": batch_id, "count": len(items), "items": items}
+
+    @app.get("/drift/summary")
+    def drift_summary(
+        run_id: str | None = None, batch_id: str | None = None
+    ) -> dict[str, Any]:
+        resolved = _resolve_run(storage, run_id, batch_id)
+        drift_store = DriftStore(storage)
+        payload = drift_store.get_drift_run(resolved)
+        if payload is None:
+            raise HTTPException(404, f"no drift summary for run {resolved!r}")
+        return payload
+
+    @app.get("/drift/baseline")
+    def drift_baseline() -> dict[str, Any]:
+        drift_store = DriftStore(storage)
+        versions = drift_store.list_baseline_versions()
+        latest = drift_store.load_latest_baseline()
+        return {
+            "latest_version": latest.version if latest else 0,
+            "versions": versions,
+            "fields": sorted(latest.stats) if latest else [],
+        }
+
+    @app.post("/drift/baseline/rebuild", status_code=201)
+    def drift_baseline_rebuild(body: RunRequest) -> dict[str, Any]:
+        if storage.get_batch(body.batch_id) is None:
+            raise HTTPException(404, f"batch {body.batch_id!r} not found")
+        drift_store = DriftStore(storage)
+        drift_store.reset_baseline()
+        guard = DriftGuard(storage, config, active_clock)
+        records = [record_from_db(row) for row in storage.list_records(body.batch_id)]
+        version = guard.bootstrap_from_records(records, source_batch_id=body.batch_id)
+        record_event(
+            storage, active_clock, body.batch_id, None, "drift_baseline_rebuilt",
+            {"batch_id": body.batch_id, "records": len(records), "version": version},
+        )
+        return {"baseline_version": version, "absorbed_records": len(records)}
 
     return app

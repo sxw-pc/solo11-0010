@@ -15,6 +15,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .drift.config import DriftConfig
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_CONFIG_PATH = Path(__file__).resolve().parent / "resources" / "default.yaml"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
@@ -138,6 +140,7 @@ class AppConfig(_Strict):
     scoring: ScoringConfig
     survivorship: SurvivorshipConfig = SurvivorshipConfig()
     review: ReviewConfig = ReviewConfig()
+    drift: DriftConfig = DriftConfig()
 
     def canonical_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")

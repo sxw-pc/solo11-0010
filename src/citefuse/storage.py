@@ -110,6 +110,10 @@ class Storage(RepositoryMixin):
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL is safe across crashes (only loses the in-flight txn on
+        # power loss) and avoids an fsync on every commit, which dominates
+        # batch-write cost on network/slow filesystems.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
 

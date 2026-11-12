@@ -10,6 +10,7 @@ from .blocking import generate_candidates
 from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
+from .drift.guard import DriftGuard
 from .models import Record, record_from_db
 from .review import decision_dicts
 from .scoring import score_pair
@@ -65,6 +66,16 @@ def run_pipeline(
         last = now
 
     try:
+        # Semantic drift guard: runs before blocking. Heavy drift is removed
+        # from the eligible set (and quarantined), medium drift is tagged for
+        # the low-priority lane, minor drift is auto-corrected in memory. The
+        # guard fails open, so any internal error leaves the pipeline intact.
+        guard = DriftGuard(storage, config, clock)
+        drift_outcome = guard.guard(run_id, batch_id, records)
+        records = drift_outcome["eligible_records"]
+        drift_summary = drift_outcome["summary"]
+        mark("drift_guard")
+
         candidates, blocking_stats = generate_candidates(records, config)
         mark("blocking")
 
@@ -124,6 +135,7 @@ def run_pipeline(
             "golden_count": len(cluster_rows),
             "timings": timings,
             "blocking_stats": blocking_stats,
+            "drift_summary": drift_summary,
             "status": "completed",
             "created_at": started_at,
         }
@@ -152,6 +164,7 @@ def run_pipeline(
             "input_rows": int(batch["total_lines"]), "bad_rows": int(batch["bad_lines"]),
             "candidate_pairs": 0, "matched_edges": 0, "cluster_count": 0,
             "golden_count": 0, "timings": timings, "blocking_stats": {},
+            "drift_summary": locals().get("drift_summary"),
             "status": "failed", "created_at": started_at,
         }
         storage.save_run(failed)
@@ -163,6 +176,7 @@ def run_pipeline(
         **run_common,
         "timings": timings,
         "blocking_stats": blocking_stats,
+        "drift_summary": drift_summary,
         "conflicts": conflicts,
         "clusters": [
             {"cluster_id": row["cluster_id"], "member_keys": row["member_keys"],

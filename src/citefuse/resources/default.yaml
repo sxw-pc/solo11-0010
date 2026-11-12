@@ -80,3 +80,93 @@ review:
   # Unresolved pairs in [review_low, match_threshold) are available to reviewers.
   default_page_size: 10
   max_page_size: 100
+
+drift:
+  # Field-level semantic drift guard, executed before blocking. Every rule and
+  # threshold below is part of the config fingerprint, so edits are auditable.
+  enabled: true
+  # On any internal guard error, skip detection and keep the pipeline running.
+  fail_open: true
+  include_summary: true
+  # Per-record audit events are verbose; the per-run summary is always emitted.
+  audit_per_record: false
+
+  severity:
+    # Continuous drift score -> tier cut-offs (minor <= medium <= heavy).
+    minor: 0.25
+    medium: 0.55
+    heavy: 0.80
+
+  baseline:
+    # Minimum historical observations before distribution checks activate.
+    min_samples: 20
+    # Fold accepted (clean/minor) records back into a new baseline version.
+    update_on_run: true
+    absorb_max_tier: minor
+    max_categories: 500
+    max_profile_features: 1000
+
+  year:
+    enabled: true
+    weight: 1.0
+    min_year: 1500
+    max_year: 2100
+    two_digit_pivot: 70
+    outlier_sigmas: 3.0
+    score_era_modern: 0.30
+    score_era_imperial: 0.60
+    score_era_unparsed: 0.70
+    score_unrecognized: 0.90
+    score_outlier: 0.60
+    score_two_digit: 0.30
+
+  source:
+    enabled: true
+    weight: 1.0
+    # Canonical codes accepted without a baseline.
+    known_codes: [ORBIT, LANTERN, MEADOW, COMPASS]
+    # Fictional organization full names / aliases -> canonical code.
+    aliases:
+      Orbital Bibliographic Exchange: ORBIT
+      The Orbital Bibliographic Exchange Network: ORBIT
+      Lantern Literature Aggregator: LANTERN
+      Lantern Literature Aggregation Service: LANTERN
+      Meadow Metadata Consortium: MEADOW
+      The Meadow Metadata Consortium: MEADOW
+      Compass Citation Cooperative: COMPASS
+      Compass Citation Cooperative Society: COMPASS
+    score_alias: 0.30
+    score_unknown_category: 0.65
+    score_unrecognized: 0.90
+    code_min_len: 2
+    code_max_len: 20
+
+  authors:
+    enabled: true
+    weight: 1.0
+    # Case-insensitive collective/corporate authorship markers.
+    collective_markers:
+      [consortium, cooperative, working group, task force, society,
+       association, institute, laboratory, council, network, committee,
+       collaboration, center, centre, department, ministry, organization,
+       协作组, 课题组, 委员会, 学会, 协会, 研究院, 研究所, 实验室, 中心, 工作组]
+    score_collective_only: 0.65
+    score_collective_mixed: 0.35
+    score_unrecognized: 0.90
+    junk_char_ratio: 0.45
+
+  generic:
+    # DOI shape guard. DOI is a high-cardinality identifier, so only its
+    # structural pattern is validated; a well-formed DOI is never penalized for
+    # being previously unseen. A malformed DOI is heavy drift.
+    doi:
+      enabled: true
+      weight: 0.8
+      kind: shape
+      pattern: '10\.[0-9]{4,9}/\S+'
+      score_pattern_violation: 0.85
+      score_unknown_category: 0.60
+      score_numeric_outlier: 0.60
+      min_profile_similarity: 0.25
+      score_profile_drift: 0.55
+      outlier_sigmas: 3.0
