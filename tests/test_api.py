@@ -77,8 +77,25 @@ def test_end_to_end_api_contract(client, seeded_paths):
         "reviewer": "qa", "note": "API contract",
     })
     assert decision.status_code == 201
-    assert decision.json()["run"]["run_id"] != run_id
+    payload = decision.json()
+    assert "run" not in payload  # decisions no longer synchronously rerun
+    assert payload["decision"]["decision"] == "different"
+    assert payload["view"]["view_version"] >= 1
+    # Instant reflow: the decided pair disappears from the queue offline.
+    refreshed = client.get(
+        "/review/next", params={"batch_id": "API", "n": 100}
+    ).json()["pairs"]
+    assert all(item["pair_key"] != pair["pair_key"] for item in refreshed)
     assert client.get("/review/decisions", params={"batch_id": "API"}).json()[0]["decision"] == "different"
+    # The offline projection predicts the next run without executing it.
+    preview = client.get("/review/reflow", params={"batch_id": "API"}).json()
+    assert preview["view_version"] == payload["view"]["view_version"]
+    assert pair["pair_key"] in preview["excluded_different"]
+    assert preview["candidate_pairs_effective"] == preview["candidate_pairs_before"] - 1
+    next_run = client.post("/runs", json={"batch_id": "API"})
+    assert next_run.status_code == 201
+    assert next_run.json()["run_id"] != run_id
+    assert next_run.json()["candidate_pairs"] == preview["candidate_pairs_effective"]
 
     assert client.get("/batches/missing").status_code == 404
     assert client.get("/runs/missing").status_code == 404

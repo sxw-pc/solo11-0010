@@ -11,13 +11,22 @@ from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
 from .models import Record, record_from_db
+from .reflow import load_snapshot, project_reflow, snapshot_fingerprint
 from .review import decision_dicts
 from .scoring import score_pair
 from .storage import Storage
 from .survivorship import build_golden
 
 
-def _run_id(batch: Any, config: AppConfig, decisions: list[dict[str, Any]]) -> str:
+def _run_id(
+    batch: Any,
+    config: AppConfig,
+    decisions: list[dict[str, Any]],
+    view_fingerprint: str | None = None,
+) -> str:
+    # The view fingerprint is identity-based (canonical record-key pairs + view
+    # version), so run_id no longer changes when a drifting pair_key is rewritten.
+    # The decision history fingerprint is retained for backward traceability.
     decision_fp = json.dumps(
         [
             [item["pair_key"], item["decision"], item["submitted_at"], item["decision_id"]]
@@ -26,7 +35,13 @@ def _run_id(batch: Any, config: AppConfig, decisions: list[dict[str, Any]]) -> s
         separators=(",", ":"),
     )
     material = "|".join(
-        [batch["batch_id"], batch["input_hash"], config.fingerprint(), decision_fp]
+        [
+            batch["batch_id"],
+            batch["input_hash"],
+            config.fingerprint(),
+            decision_fp,
+            view_fingerprint or "",
+        ]
     )
     return "run_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -53,7 +68,12 @@ def run_pipeline(
         raise LookupError(f"batch {batch_id!r} not found")
     records = _load_records(storage, batch_id)
     history = decision_dicts(storage, batch_id)
-    run_id = _run_id(batch, config, history)
+    # Pin one immutable, versioned decision snapshot for the whole attempt. Two
+    # concurrent runs of the same batch therefore see identical decision state:
+    # the storage lock serializes snapshot loading and both pin the same version.
+    snapshot = load_snapshot(storage, batch_id)
+    view_fingerprint = snapshot_fingerprint(snapshot)
+    run_id = _run_id(batch, config, history, view_fingerprint)
     started_at = clock.now_iso()
     timings: dict[str, float] = {}
     last = start = clock.monotonic()
@@ -82,6 +102,19 @@ def run_pipeline(
             })
         mark("scoring")
 
+        # Instant reflow: effective decisions override candidate classification
+        # before clustering. 'different' pairs leave the candidate pool; 'same'
+        # pairs are forced into the edge set. The offline /review view projects
+        # exactly this function, so queue filtering and the next run agree.
+        reflow = project_reflow(records, scored_pairs, snapshot)
+        excluded_keys = set(reflow.excluded_pair_keys)
+        persisted_pairs = [
+            {**pair, "excluded_by_decision": pair["pair_key"] in excluded_keys}
+            for pair in scored_pairs
+        ]
+        effective_pairs = [
+            pair for pair in scored_pairs if pair["pair_key"] not in excluded_keys
+        ]
         model_edges = [
             {
                 "pair_key": item["pair_key"],
@@ -90,7 +123,7 @@ def run_pipeline(
                 "score": item["score"],
                 "details": item["details"],
             }
-            for item in scored_pairs
+            for item in effective_pairs
             if item["zone"] == "match"
         ]
         groups, applied_edges, conflicts = cluster_records(records, model_edges, history)
@@ -118,17 +151,21 @@ def run_pipeline(
             "config_hash": config.fingerprint(),
             "input_rows": int(batch["total_lines"]),
             "bad_rows": int(batch["bad_lines"]),
-            "candidate_pairs": len(scored_pairs),
+            # candidate_pairs is the post-reflow pool: human 'different' pairs
+            # have been removed; human 'same' pairs remain counted as candidates
+            # but enter the edge set regardless of their model score.
+            "candidate_pairs": len(effective_pairs),
             "matched_edges": len(applied_edges),
             "cluster_count": len(cluster_rows),
             "golden_count": len(cluster_rows),
             "timings": timings,
             "blocking_stats": blocking_stats,
             "status": "completed",
+            "decision_view_version": snapshot.version,
             "created_at": started_at,
         }
         storage.save_run(run_common)
-        storage.replace_pairs(run_id, scored_pairs)
+        storage.replace_pairs(run_id, persisted_pairs)
         storage.replace_edges(run_id, applied_edges)
         storage.replace_clusters(run_id, batch_id, cluster_rows)
         mark("persistence")
@@ -143,8 +180,9 @@ def run_pipeline(
         })
         record_event(
             storage, clock, batch_id, run_id, "run_completed",
-            {"candidate_pairs": len(scored_pairs), "clusters": len(cluster_rows),
-             "conflicts": len(conflicts)},
+            {"candidate_pairs": len(effective_pairs), "clusters": len(cluster_rows),
+             "conflicts": len(conflicts),
+             "decision_view_version": snapshot.version},
         )
     except Exception as exc:
         failed = {
@@ -152,7 +190,8 @@ def run_pipeline(
             "input_rows": int(batch["total_lines"]), "bad_rows": int(batch["bad_lines"]),
             "candidate_pairs": 0, "matched_edges": 0, "cluster_count": 0,
             "golden_count": 0, "timings": timings, "blocking_stats": {},
-            "status": "failed", "created_at": started_at,
+            "status": "failed", "decision_view_version": snapshot.version,
+            "created_at": started_at,
         }
         storage.save_run(failed)
         storage.add_attempt({**failed, "started_at": started_at, "finished_at": clock.now_iso()})

@@ -21,9 +21,12 @@ from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
 from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
-from .models import DecisionRequest, RunRequest
+from .models import DecisionRequest, RunRequest, record_from_db
 from .pipeline import run_pipeline
-from .review import decision_dicts, next_review_pairs, submit_decision
+from .reflow import load_snapshot, project_reflow
+from .review import (
+    decision_dicts, next_review_pairs, review_view_status, submit_decision,
+)
 from .storage import Storage
 
 
@@ -175,16 +178,69 @@ def create_app(
     @app.post("/review/decisions", status_code=201)
     def review_decision(body: DecisionRequest) -> dict[str, Any]:
         try:
+            # The decision is effective immediately via the versioned view; no
+            # synchronous pipeline rerun is required. /review/next filters the
+            # pair offline, and the next /runs applies the same pinned view.
             decision = submit_decision(
                 storage, active_clock, body.batch_id, body.pair_key,
                 body.decision, body.reviewer, body.note,
             )
-            rebuilt = run_pipeline(storage, config, active_clock, body.batch_id)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return {"decision": decision, "run": _pipeline_public(rebuilt)}
+        return {"decision": decision, "view": review_view_status(storage, body.batch_id)}
+
+    @app.get("/review/view")
+    def review_view(batch_id: str) -> dict[str, Any]:
+        if storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        return review_view_status(storage, batch_id)
+
+    @app.get("/review/reflow")
+    def review_reflow(batch_id: str) -> dict[str, Any]:
+        """Offline projection of the decision view onto the latest run.
+
+        Shows what the next /runs will produce *without* running it: candidate
+        pool count after 'different' exclusions, forced 'same' edges and the
+        resulting clusters. The projection uses the same pinned snapshot and
+        clustering code as a real run, so the two cannot diverge.
+        """
+        if storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        run_id = storage.latest_run_id(batch_id)
+        if run_id is None:
+            raise HTTPException(404, f"batch {batch_id!r} has no pipeline run")
+        records = [
+            record_from_db(row) for row in storage.list_records(batch_id)
+        ]
+        scored_pairs = [
+            {
+                "pair_key": row["pair_key"],
+                "rec_a_pk": row["rec_a_pk"],
+                "rec_b_pk": row["rec_b_pk"],
+                "score": row["score"],
+                "zone": row["zone"],
+                "details": json.loads(row["details_json"]),
+            }
+            for row in storage.list_pairs(run_id)
+        ]
+        snapshot = load_snapshot(storage, batch_id)
+        projection = project_reflow(records, scored_pairs, snapshot)
+        return {
+            "batch_id": batch_id,
+            "base_run_id": run_id,
+            "view_version": snapshot.version,
+            "candidate_pairs_before": len(scored_pairs),
+            "candidate_pairs_effective": len(projection.candidate_pairs),
+            "excluded_different": sorted(projection.excluded_pair_keys),
+            "forced_same_edges": [
+                edge["pair_key"] for edge in projection.forced_same_edges
+            ],
+            "matched_edges": len(projection.applied_edges),
+            "cluster_count": len(projection.groups),
+            "conflicts": projection.conflicts,
+        }
 
     @app.get("/review/decisions")
     def list_decisions(batch_id: str | None = None) -> list[dict[str, Any]]:

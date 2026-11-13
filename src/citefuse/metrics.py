@@ -99,10 +99,12 @@ def _threshold_groups(
 ) -> tuple[list[Record], list[list[Record]]]:
     records = _records(storage, batch_id)
     history = decision_dicts(storage, batch_id)
+    # Honor the instant-reflow view: pairs removed from the candidate pool by a
+    # human 'different' decision must not re-enter through threshold replay.
     edges = [
         {"pair_key": row["pair_key"], "rec_a_pk": row["rec_a_pk"],
          "rec_b_pk": row["rec_b_pk"], "score": row["score"]}
-        for row in storage.list_pairs(run_id)
+        for row in storage.list_pairs(run_id, include_excluded=False)
         if row["score"] >= threshold
     ]
     groups, _, _ = cluster_records(records, edges, history)

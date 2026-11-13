@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS runs (
   matched_edges INTEGER NOT NULL, cluster_count INTEGER NOT NULL,
   golden_count INTEGER NOT NULL, timings_json TEXT NOT NULL,
   blocking_stats_json TEXT NOT NULL, status TEXT NOT NULL,
+  decision_view_version INTEGER,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_runs_batch ON runs(batch_id);
@@ -58,13 +59,19 @@ CREATE TABLE IF NOT EXISTS run_attempts (
   candidate_pairs INTEGER NOT NULL, matched_edges INTEGER NOT NULL,
   cluster_count INTEGER NOT NULL, golden_count INTEGER NOT NULL,
   timings_json TEXT NOT NULL, status TEXT NOT NULL,
+  decision_view_version INTEGER,
   started_at TEXT NOT NULL, finished_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pairs (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   pair_key TEXT NOT NULL, rec_a_pk INTEGER NOT NULL, rec_b_pk INTEGER NOT NULL,
   score REAL NOT NULL, zone TEXT NOT NULL, strategies_json TEXT NOT NULL,
-  details_json TEXT NOT NULL, PRIMARY KEY(run_id, pair_key)
+  details_json TEXT NOT NULL,
+  -- 1 when an effective human 'different' decision removed this pair from the
+  -- candidate pool during instant reflow; the scored row is retained for audit
+  -- and review validation but excluded from candidate_pairs and clustering.
+  excluded_by_decision INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(run_id, pair_key)
 );
 CREATE INDEX IF NOT EXISTS idx_pairs_zone ON pairs(run_id, zone);
 CREATE TABLE IF NOT EXISTS edges (
@@ -87,6 +94,24 @@ CREATE TABLE IF NOT EXISTS decisions (
   submitted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_batch ON decisions(batch_id, pair_key);
+-- Batch-level versioned, materialized decision view ("instant reflow view").
+-- Exactly one *effective* decision per canonical record-key pair per batch.
+-- Identity is the canonical record-key pair, NOT pair_key: a pair_key that
+-- drifts after record retransmission can no longer silently orphan a decision.
+-- decisions/ remains the append-only audit source of truth; this table is its
+-- idempotent, versioned projection and is rebuilt from history on first touch.
+CREATE TABLE IF NOT EXISTS decision_state (
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  pair_key TEXT NOT NULL,
+  rec_a_key TEXT NOT NULL, rec_b_key TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('same','different')),
+  reviewer TEXT NOT NULL, note TEXT NOT NULL,
+  decision_id INTEGER NOT NULL,
+  submitted_at TEXT NOT NULL,
+  view_version INTEGER NOT NULL,
+  PRIMARY KEY(batch_id, rec_a_key, rec_b_key)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_state_batch ON decision_state(batch_id);
 CREATE TABLE IF NOT EXISTS audit_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT, batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -112,6 +137,24 @@ class Storage(RepositoryMixin):
         self.conn.execute("PRAGMA journal_mode=WAL")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Idempotent column migrations for databases created by older versions."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "decision_view_version" not in existing:
+            conn.execute("ALTER TABLE runs ADD COLUMN decision_view_version INTEGER")
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(run_attempts)")
+        }
+        if "decision_view_version" not in existing:
+            conn.execute("ALTER TABLE run_attempts ADD COLUMN decision_view_version INTEGER")
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(pairs)")}
+        if "excluded_by_decision" not in existing:
+            conn.execute(
+                "ALTER TABLE pairs ADD COLUMN excluded_by_decision INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
