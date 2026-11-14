@@ -11,6 +11,7 @@ from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
 from .models import Record, record_from_db
+from .preflight import degraded_summary, preflight_summary
 from .review import decision_dicts
 from .scoring import score_pair
 from .storage import Storage
@@ -57,6 +58,7 @@ def run_pipeline(
     started_at = clock.now_iso()
     timings: dict[str, float] = {}
     last = start = clock.monotonic()
+    preflight: dict[str, Any] = {}
 
     def mark(stage: str) -> None:
         nonlocal last
@@ -65,7 +67,29 @@ def run_pipeline(
         last = now
 
     try:
+        # Field-quality preflight, computed at run time right before
+        # blocking rather than at ingest time: grading depends on the
+        # preflight thresholds in this run's config (whose hash is part of
+        # run_id), so each run gets a summary bound to its own thresholds
+        # and two runs over one batch never share summaries. Ingest-time
+        # computation would leak run-level judgement into batch metadata,
+        # go stale when a re-posted batch short-circuits on input_hash, and
+        # race under concurrent uploads of the same batch. The O(n) rescan
+        # per run is negligible next to blocking's O(sum(bucket_size^2)).
+        # See preflight.py for the full rationale.
+        try:
+            preflight = preflight_summary(records, config)
+        except Exception as exc:  # preflight must never abort the pipeline
+            preflight = degraded_summary(f"{type(exc).__name__}: {exc}")
+        if preflight.get("degraded"):
+            record_event(
+                storage, clock, batch_id, run_id, "preflight_degraded",
+                {"reason": preflight.get("reason", "unknown")},
+            )
+        mark("preflight")
+
         candidates, blocking_stats = generate_candidates(records, config)
+        blocking_stats["preflight"] = preflight
         mark("blocking")
 
         scored_pairs: list[dict[str, Any]] = []
@@ -151,7 +175,10 @@ def run_pipeline(
             "run_id": run_id, "batch_id": batch_id, "config_hash": config.fingerprint(),
             "input_rows": int(batch["total_lines"]), "bad_rows": int(batch["bad_lines"]),
             "candidate_pairs": 0, "matched_edges": 0, "cluster_count": 0,
-            "golden_count": 0, "timings": timings, "blocking_stats": {},
+            "golden_count": 0, "timings": timings,
+            # Keep the preflight computed before the failure: it is the most
+            # useful diagnostic when blocking/scoring blows up on bad input.
+            "blocking_stats": {"preflight": preflight} if preflight else {},
             "status": "failed", "created_at": started_at,
         }
         storage.save_run(failed)

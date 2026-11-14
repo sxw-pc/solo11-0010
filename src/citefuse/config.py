@@ -106,6 +106,30 @@ class ReviewConfig(_Strict):
     max_page_size: int = Field(default=100, ge=1, le=1000)
 
 
+class PreflightConfig(_Strict):
+    """Thresholds for the field-quality preflight that runs before blocking.
+
+    All rates are fractions in [0, 1] of the valid normalized records in the
+    batch. A metric at or above its critical threshold raises a critical
+    alert; at or above warn (but below critical) a warning. Alerts are
+    advisory only and never change blocking, scoring or clustering.
+    """
+
+    enabled: bool = True
+    warn_missing_rate: float = Field(default=0.25, ge=0.0, le=1.0)
+    critical_missing_rate: float = Field(default=0.60, ge=0.0, le=1.0)
+    warn_anomaly_rate: float = Field(default=0.10, ge=0.0, le=1.0)
+    critical_anomaly_rate: float = Field(default=0.30, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "PreflightConfig":
+        if self.warn_missing_rate > self.critical_missing_rate:
+            raise ValueError("warn_missing_rate must be <= critical_missing_rate")
+        if self.warn_anomaly_rate > self.critical_anomaly_rate:
+            raise ValueError("warn_anomaly_rate must be <= critical_anomaly_rate")
+        return self
+
+
 class SurvivorshipConfig(_Strict):
     title: str = "longest"
     authors: str = "non_null_concat"
@@ -138,6 +162,7 @@ class AppConfig(_Strict):
     scoring: ScoringConfig
     survivorship: SurvivorshipConfig = SurvivorshipConfig()
     review: ReviewConfig = ReviewConfig()
+    preflight: PreflightConfig = PreflightConfig()
 
     def canonical_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")

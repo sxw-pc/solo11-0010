@@ -132,11 +132,16 @@ def build_report(
         storage, config, run["batch_id"], run_id, applied_threshold
     )
     result = evaluate_groups(records, groups)
+    # Expose the same preflight snapshot stored in the run's blocking_stats.
+    # Legacy runs written before preflight existed have no such key; .get()
+    # keeps those reports readable instead of raising KeyError.
+    blocking_stats = json.loads(run["blocking_stats_json"])
     report = {
         "run_id": run_id,
         "batch_id": run["batch_id"],
         "config_hash": run["config_hash"],
         "threshold": applied_threshold,
+        "preflight": blocking_stats.get("preflight"),
         **result,
     }
     path = reports_dir / f"{run_id}.json"

@@ -81,6 +81,7 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `year_diff_scores` | `[1.0, .75, .40]` | 相差 0/1/2 年得分，≥3 年为 0。 |
 | `review_low` | `0.68` | 灰区下界；低于此值直接判为不同，不进复核。 |
 | `match_threshold` | `0.80` | 自动连边阈值；灰区为 `[0.68, 0.80)`。 |
+| `preflight.warn_*` / `preflight.critical_*` | 缺失率 `0.25/0.60`，异常率 `0.10/0.30` | 运行前字段质量预检的分级告警阈值；只解释候选对量，不改变匹配结果。 |
 | `survivorship.*` | 见下节 | 字段级金记录规则。 |
 | `source_priority` | ORBIT > LANTERN > MEADOW > COMPASS | 并列时的确定性来源优先级，未列出的来源排最后。 |
 | `review.default_page_size` / `max_page_size` | 10 / 100 | 复核队列默认与上限。 |
@@ -92,7 +93,7 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `batches` | `batch_id`, `input_hash`, `total_lines`, `valid_lines`, `bad_lines` | 批次及统计；重复内容由 `input_hash` 识别。 |
 | `records` | `record_pk`, `(batch_id,source,record_id) UNIQUE`, `raw_json`, `norm_json`, 各归一列 | 原始值与归一值双份保存。 |
 | `dead_letters` | `line_no`, `reason`, `raw_text` | 逐行校验失败，不阻断整批。 |
-| `runs` | `run_id`, `config_hash`, 各计数, `timings_json`, `blocking_stats_json`, `status` | 一次逻辑运行的可复现快照。 |
+| `runs` | `run_id`, `config_hash`, 各计数, `timings_json`, `blocking_stats_json`, `status` | 一次逻辑运行的可复现快照；`blocking_stats_json` 内含本次运行的字段质量预检摘要（`preflight` 键）。 |
 | `run_attempts` | 与 `runs` 相同计数 + `started_at`, `finished_at` | 每次实际调用都追加一条审计尝试记录。 |
 | `pairs` | `pair_key`, 两记录主键, `score`, `zone`, `details_json` | 所有候选对的总分与分项得分明细。 |
 | `edges` | `pair_key`, `kind=model/human_same`, `score` | 实际参与聚类的匹配边。 |
@@ -103,6 +104,12 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 `run_id` 由批次内容哈希、配置哈希和裁定历史确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。
 
 输入记录还可附带可选的评估字段 `gold_cluster`（fixture 自带）。它只用于 `GET /metrics/report` 与阈值扫描，绝不参与阻塞、打分或聚类。
+
+### 字段质量预检（preflight）
+
+每次运行在阻塞配对**之前**对批次做一次字段质量预检：对 title、authors、venue、year、pages、doi 六个核心字段，以**有效归一记录数**为分母计算缺失率（归一后为空）与异常形态率（值存在但不可信，如占位符标题、无有效签名 token 的标题、只有姓的作者、未配置别名的刊名、形态非法的 DOI），并按 `preflight.*` 阈值生成 `warning`/`critical` 分级告警。摘要嵌入该次运行的 `blocking_stats.preflight`，随 `/runs` 与 `/metrics/report` 返回，用来解释候选对量为何异常。
+
+预检放在运行前而非 ingest 时：分级依赖运行配置中的阈值（其哈希参与 `run_id` 派生），因此同一批次用不同阈值跑出的两个 run 各自持有独立摘要；ingest 时计算则会把运行级判断写进批次元数据，且相同 `input_hash` 重传会短路、并发上传会互相覆盖。预检是 O(n) 单次扫描，代价远低于其后的阻塞阶段。有效记录为 0 时所有比率为 `null`（不除零）并输出降级摘要；预检自身异常同样降级为空摘要并记录 `preflight_degraded` 审计事件，绝不阻断主链路。升级前写入的历史 run 没有 `preflight` 键，`/runs` 与 `/metrics/report` 读取时按缺失处理（报告中为 `null`），不会报错。
 
 ## 5. API 一览
 
@@ -134,9 +141,13 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 ```json
 {"run_id":"run_232907b32f3380aa","batch_id":"DEMO","config_hash":"ffdf...","input_rows":200,
  "bad_rows":0,"candidate_pairs":218,"matched_edges":116,"cluster_count":120,
- "golden_count":120,"timings":{"blocking":0.001,"scoring":0.02,"clustering":0.001,
+ "golden_count":120,"timings":{"preflight":0.001,"blocking":0.001,"scoring":0.02,"clustering":0.001,
  "golden":0.001,"persistence":0.003,"total":0.026},"blocking_stats":
- {"strategy_counts":{"year_venue":186,"title_signature":120,"author_year":83},"union_count":218},
+ {"strategy_counts":{"year_venue":186,"title_signature":120,"author_year":83},"union_count":218,
+ "preflight":{"enabled":true,"record_count":200,"degraded":false,"status":"ok",
+ "fields":{"title":{"missing":0,"anomalous":0,"missing_rate":0.0,"anomaly_rate":0.0},"...":"..."},
+ "alerts":[],"thresholds":{"warn_missing_rate":0.25,"critical_missing_rate":0.6,
+ "warn_anomaly_rate":0.1,"critical_anomaly_rate":0.3}}},
  "status":"completed","conflicts":[]}
 ```
 

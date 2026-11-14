@@ -80,3 +80,14 @@ review:
   # Unresolved pairs in [review_low, match_threshold) are available to reviewers.
   default_page_size: 10
   max_page_size: 100
+
+preflight:
+  # Field-quality preflight computed per run, right before blocking. Rates
+  # are fractions of the valid normalized records; a metric >= its critical
+  # threshold raises a critical alert, >= warn a warning. Alerts are
+  # advisory: they explain candidate-pair volume but never change matching.
+  enabled: true
+  warn_missing_rate: 0.25
+  critical_missing_rate: 0.60
+  warn_anomaly_rate: 0.10
+  critical_anomaly_rate: 0.30
