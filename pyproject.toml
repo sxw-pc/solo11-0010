@@ -7,16 +7,20 @@ name = "citefuse"
 version = "0.1.0"
 description = "Fully offline bibliographic record deduplication and golden-record engine"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
   "fastapi~=0.115.0",
   "uvicorn~=0.32.0",
-  "PyYAML~=6.0",
-  "pydantic~=2.9.0",
+  "PyYAML~=6.0.2",
+  "pydantic~=2.9.2",
 ]
 
 [project.optional-dependencies]
-test = ["pytest~=8.3.0", "httpx~=0.27.0"]
+# anyio<4.15: anyio 4.15 deprecates the anyio.abc.* aliases that starlette's
+# TestClient (starlette <= 0.48) imports at module load; the cap keeps the
+# suite green under -W error::DeprecationWarning until the fastapi/starlette
+# baseline is deliberately raised (starlette >= 1.x uses the new anyio API).
+test = ["pytest~=8.3.3", "httpx~=0.28.1", "anyio<4.15"]
 
 [project.scripts]
 citefuse = "citefuse.app:main"

@@ -3,6 +3,13 @@
 All SQL is parameterized. The single app-wide connection is guarded by a
 re-entrant lock so FastAPI's worker threads can share it safely. Run, pair,
 cluster and review queries live in repository.py.
+
+Startup also runs a timestamp migration: legacy persisted timestamps (naive
+``datetime.utcnow().isoformat()`` strings, ``+00:00`` offsets, fractional
+seconds, space separators) are rewritten to the canonical contract defined in
+``clock.py``. The migration is idempotent (canonical values are skipped, so
+repeated startups perform no writes) and runs inside a single transaction, so
+a failure rolls back every rewrite and the next startup retries from scratch.
 """
 from __future__ import annotations
 
@@ -13,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .clock import is_canonical_timestamp, normalize_timestamp
 from .repository import RepositoryMixin
 
 SCHEMA = """
@@ -100,6 +108,50 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+#: Every persisted timestamp column, by table. Values in these columns must
+#: satisfy the canonical contract in clock.py; anything else is legacy data.
+_TIMESTAMP_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("batches", ("created_at", "updated_at")),
+    ("runs", ("created_at",)),
+    ("run_attempts", ("started_at", "finished_at")),
+    ("decisions", ("submitted_at",)),
+    ("audit_events", ("created_at",)),
+)
+
+
+def _migrate_timestamps(conn: sqlite3.Connection) -> dict[str, int]:
+    """Rewrite legacy persisted timestamps to the canonical contract.
+
+    Returns the number of rewritten rows per table. Idempotent: canonical
+    values are skipped, so a second run rewrites nothing. Unparseable values
+    are left untouched rather than destroyed. Must be called inside
+    ``Storage.transaction()`` so a failure rolls back every rewrite.
+    """
+    rewritten: dict[str, int] = {}
+    for table, columns in _TIMESTAMP_COLUMNS:
+        projection = ", ".join(["rowid AS _migration_rowid", *columns])
+        rows = list(conn.execute(f"SELECT {projection} FROM {table}"))
+        count = 0
+        for row in rows:
+            changed: dict[str, str] = {}
+            for column in columns:
+                value = row[column]
+                if not isinstance(value, str) or is_canonical_timestamp(value):
+                    continue
+                normalized = normalize_timestamp(value)
+                if normalized is not None and normalized != value:
+                    changed[column] = normalized
+            if changed:
+                assignments = ", ".join(f"{column}=?" for column in changed)
+                conn.execute(
+                    f"UPDATE {table} SET {assignments} WHERE rowid=?",
+                    (*changed.values(), row["_migration_rowid"]),
+                )
+                count += 1
+        rewritten[table] = count
+    return rewritten
+
+
 class Storage(RepositoryMixin):
     def __init__(self, db_path: str | Path) -> None:
         path = Path(db_path)
@@ -112,6 +164,16 @@ class Storage(RepositoryMixin):
         self.conn.execute("PRAGMA journal_mode=WAL")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
+        try:
+            with self.transaction() as conn:
+                #: Rows rewritten per table by the startup timestamp migration;
+                #: all zeros when the database already satisfies the contract.
+                self.timestamp_migration = _migrate_timestamps(conn)
+        except Exception:
+            # Rollback (in transaction()) leaves the file unmigrated; close so
+            # the failed open cannot hold locks, then let the caller see it.
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         with self._lock:

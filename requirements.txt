@@ -1,6 +1,11 @@
 fastapi~=0.115.0
 uvicorn~=0.32.0
-PyYAML~=6.0
-pydantic~=2.9.0
-pytest~=8.3.0
-httpx~=0.27.0
+PyYAML~=6.0.2
+pydantic~=2.9.2
+pytest~=8.3.3
+httpx~=0.28.1
+# anyio 4.15 deprecates the anyio.abc.* aliases that starlette's TestClient
+# (starlette <= 0.48) imports at module load. Cap it so the test suite stays
+# green under -W error::DeprecationWarning; the cap can be dropped once the
+# fastapi/starlette baseline is raised to starlette >= 1.x.
+anyio<4.15

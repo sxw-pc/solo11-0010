@@ -23,7 +23,7 @@
 
 ## 2. 快速上手
 
-要求 Python ≥ 3.11。依赖安装完成后可完全断网运行。
+要求 Python ≥ 3.13。依赖安装完成后可完全断网运行。
 
 ```bash
 # 1) 安装依赖 + 安装本项目包（提供 citefuse 包）
@@ -211,6 +211,16 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 时间戳和耗时通过可注入 `Clock` 获取；测试使用 `FixedClock`。所有集合排序显式，JSON 使用排序键。
 - 配置 SHA-256 写入 `runs.config_hash` 和指标报告；报告位于 `data/reports/{run_id}.json` 与 `{run_id}_thresholds.json`。
 - 指标：pairwise TP/FP/FN 基于金标准簇；簇级完全一致率 = 与某个金标准簇成员集合完全相同的预测簇数 / 有金标签的预测簇数。阈值扫描仅复用 `pairs.score`，不重跑归一化或阻塞。
+
+### 时间戳契约
+
+所有落库时间戳（`batches.created_at/updated_at`、`runs.created_at`、`run_attempts.started_at/finished_at`、`decisions.submitted_at`、`audit_events.created_at`）统一为**契约格式**：UTC、ISO 8601、秒级精度、`Z` 后缀，即 `YYYY-MM-DDTHH:MM:SSZ`，恒为 20 字符。取舍：
+
+- **不定宽朴素字符串**：`datetime.utcnow()`（3.12 起弃用）产生的不带时区串语义含糊；更糟的是与带 `Z`/带偏移/带小数的串混排时，字典序不再等于时间序（`.` 的 ASCII 小于 `Z`），`ORDER BY`、字符串比较和导出格式都会悄悄漂移。
+- **epoch 秒**：排序安全，但牺牲可读性，且改变所有下游消费时间字段的格式，导出面漂移最大。
+- **定宽 `Z` 串（采用）**：宽度与精度固定 ⇒ 字典序 == 时间序；RFC 3339 兼容，下游任何 ISO 解析器都能读；来源唯一（`datetime.now(timezone.utc)`，代码中不使用 `utcnow()`）。
+
+**旧库迁移**：`Storage` 打开数据库时在单个事务内把历史时间戳规范化为契约格式——朴素串按 UTC 解释（即旧 `utcnow()` 语义）、`+00:00`/其他偏移换算到 UTC、亚秒精度截断、空格分隔符归一。迁移幂等可重入：已符合契约的值一律跳过，重复启动零改写；任一步异常整体回滚，不留半迁移状态，下次启动重试；无法解析的值原样保留，绝不毁损数据。迁移不触碰 `timings_json`（耗时浮点数，非时间戳）。注意：`run_id` 由含 `submitted_at` 的裁定历史派生，若旧库时间戳被改写（而非恰好是契约串去掉 `Z`），迁移后首次重跑会得到新的 `run_id`；旧 run 行保留为历史，仍可查询、评测与导出。
 
 ## 8. 已知局限
 
