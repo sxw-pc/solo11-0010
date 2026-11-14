@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 
 def _dumps(value: Any) -> str:
@@ -167,3 +167,110 @@ class RepositoryMixin:
             "SELECT * FROM decisions WHERE batch_id=? ORDER BY submitted_at,decision_id",
             (batch_id,),
         )
+
+    # -- versioned per-batch decision view ("instant reflux view") ----------
+    def current_decision_version(self, batch_id: str) -> int | None:
+        row = self.query_one(
+            "SELECT current_version FROM decision_view_versions WHERE batch_id=?",
+            (batch_id,),
+        )
+        return int(row["current_version"]) if row else None
+
+    def list_decision_view(
+        self, batch_id: str, view_version: int
+    ) -> list[sqlite3.Row]:
+        return self.query(
+            """SELECT * FROM decision_views WHERE batch_id=? AND view_version=?
+               ORDER BY pair_key""",
+            (batch_id, view_version),
+        )
+
+    def count_decision_view(self, batch_id: str, view_version: int) -> int:
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM decision_views WHERE batch_id=? AND view_version=?",
+            (batch_id, view_version),
+        )
+        return int(row["n"]) if row else 0
+
+    def replace_decision_view(
+        self,
+        batch_id: str,
+        view_version: int,
+        rows: list[dict[str, Any]],
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Persist one immutable, versioned effective-decision snapshot.
+
+        The (batch_id, view_version, pair_key) primary key guarantees that a
+        pair appears at most once per version even under concurrent writers.
+        """
+        sql = (
+            "INSERT INTO decision_views(batch_id,view_version,pair_key,rec_a_key,"
+            "rec_b_key,decision,decision_id,reviewer,note,submitted_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)"
+        )
+        payload = [
+            (batch_id, view_version, item["pair_key"], item["rec_a_key"],
+             item["rec_b_key"], item["decision"], item["decision_id"],
+             item["reviewer"], item["note"], item["submitted_at"])
+            for item in rows
+        ]
+        if connection is not None:
+            connection.execute(
+                "INSERT INTO decision_view_versions(batch_id,current_version)"
+                " VALUES(?,?) ON CONFLICT(batch_id) DO UPDATE SET"
+                " current_version=excluded.current_version",
+                (batch_id, view_version),
+            )
+            connection.executemany(sql, payload)
+            return
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO decision_view_versions(batch_id,current_version)"
+                " VALUES(?,?) ON CONFLICT(batch_id) DO UPDATE SET"
+                " current_version=excluded.current_version",
+                (batch_id, view_version),
+            )
+            conn.executemany(sql, payload)
+
+    def insert_decision_and_rebuild_view(
+        self,
+        batch_id: str,
+        decision: dict[str, Any],
+        view_version: int,
+        view_builder: Callable[[], list[dict[str, Any]]],
+    ) -> int:
+        """Atomically append a decision and publish the next view version.
+
+        One transaction means reviewers can never observe a decision without
+        its view or a view whose version pointer points at missing rows. The
+        ``view_builder`` runs inside the transaction and must re-read the
+        history (which then includes the just-inserted row).
+        """
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """INSERT INTO decisions(batch_id,pair_key,rec_a_key,rec_b_key,
+                     decision,reviewer,note,submitted_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (batch_id, decision["pair_key"], decision["rec_a_key"],
+                 decision["rec_b_key"], decision["decision"], decision["reviewer"],
+                 decision["note"], decision["submitted_at"]),
+            )
+            decision_id = int(cursor.lastrowid)
+            view_rows = view_builder()
+            conn.execute(
+                "INSERT INTO decision_view_versions(batch_id,current_version)"
+                " VALUES(?,?) ON CONFLICT(batch_id) DO UPDATE SET"
+                " current_version=excluded.current_version",
+                (batch_id, view_version),
+            )
+            conn.executemany(
+                "INSERT INTO decision_views(batch_id,view_version,pair_key,rec_a_key,"
+                "rec_b_key,decision,decision_id,reviewer,note,submitted_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [(batch_id, view_version, item["pair_key"], item["rec_a_key"],
+                  item["rec_b_key"], item["decision"], item["decision_id"],
+                  item["reviewer"], item["note"], item["submitted_at"])
+                 for item in view_rows],
+            )
+        return decision_id

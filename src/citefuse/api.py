@@ -19,6 +19,7 @@ from .api_views import (
 from .audit import run_events
 from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
+from .decision_view import load_view
 from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
 from .models import DecisionRequest, RunRequest
@@ -179,12 +180,30 @@ def create_app(
                 storage, active_clock, body.batch_id, body.pair_key,
                 body.decision, body.reviewer, body.note,
             )
-            rebuilt = run_pipeline(storage, config, active_clock, body.batch_id)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return {"decision": decision, "run": _pipeline_public(rebuilt)}
+        # No synchronous rerun: the decision is immediately reflected in the
+        # batch's versioned view, so /review/next filters it offline and the
+        # next POST /runs applies it before scoring.
+        return {"decision": decision}
+
+    @app.get("/review/view")
+    def review_view(batch_id: str) -> dict[str, Any]:
+        if storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        version, rows = load_view(storage, batch_id)
+        counts = {"same": 0, "different": 0}
+        for row in rows:
+            counts[row["decision"]] += 1
+        return {
+            "batch_id": batch_id,
+            "view_version": version,
+            "effective_count": len(rows),
+            "counts": counts,
+            "decisions": rows,
+        }
 
     @app.get("/review/decisions")
     def list_decisions(batch_id: str | None = None) -> list[dict[str, Any]]:

@@ -8,8 +8,8 @@ from typing import Any
 
 from .clustering import cluster_records
 from .config import AppConfig
+from .decision_view import load_view
 from .models import Record, record_from_db
-from .review import decision_dicts
 from .storage import Storage
 
 
@@ -98,7 +98,10 @@ def _threshold_groups(
     storage: Storage, config: AppConfig, batch_id: str, run_id: str, threshold: float
 ) -> tuple[list[Record], list[list[Record]]]:
     records = _records(storage, batch_id)
-    history = decision_dicts(storage, batch_id)
+    # Reuse the batch's current effective decision view so threshold replay
+    # applies exactly the same human must-link/cannot-link state as the run,
+    # including decisions committed after the run was persisted.
+    _, history = load_view(storage, batch_id)
     edges = [
         {"pair_key": row["pair_key"], "rec_a_pk": row["rec_a_pk"],
          "rec_b_pk": row["rec_b_pk"], "score": row["score"]}

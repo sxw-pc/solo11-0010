@@ -87,6 +87,21 @@ CREATE TABLE IF NOT EXISTS decisions (
   submitted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_batch ON decisions(batch_id, pair_key);
+CREATE TABLE IF NOT EXISTS decision_view_versions (
+  batch_id TEXT PRIMARY KEY REFERENCES batches(batch_id) ON DELETE CASCADE,
+  current_version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decision_views (
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  view_version INTEGER NOT NULL,
+  pair_key TEXT NOT NULL,
+  rec_a_key TEXT NOT NULL, rec_b_key TEXT NOT NULL,
+  decision TEXT NOT NULL, decision_id INTEGER NOT NULL,
+  reviewer TEXT NOT NULL, note TEXT NOT NULL, submitted_at TEXT NOT NULL,
+  PRIMARY KEY(batch_id, view_version, pair_key)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_views_lookup
+  ON decision_views(batch_id, view_version);
 CREATE TABLE IF NOT EXISTS audit_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT, batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -126,6 +141,18 @@ class Storage(RepositoryMixin):
             except Exception:
                 self.conn.rollback()
                 raise
+
+    @contextmanager
+    def locked(self) -> Iterator[sqlite3.Connection]:
+        """Hold the serialization lock across several reads and one write.
+
+        Multi-step mutations (e.g. append decision + publish view version) use
+        this so their version allocation cannot interleave with another
+        writer; the final commit happens inside an inner ``transaction()``
+        which re-enters the same lock.
+        """
+        with self._lock:
+            yield self.conn
 
     def execute(self, sql: str, args: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         with self.transaction() as conn:

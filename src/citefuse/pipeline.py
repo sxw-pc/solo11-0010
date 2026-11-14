@@ -10,6 +10,7 @@ from .blocking import generate_candidates
 from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
+from .decision_view import pin_version, view_at
 from .models import Record, record_from_db
 from .review import decision_dicts
 from .scoring import score_pair
@@ -47,12 +48,21 @@ def run_pipeline(
 
     Identical batch + config + decisions produce the same run_id and identical
     cluster/golden rows. Each invocation still appends a run_attempts audit row.
+
+    The run pins an immutable decision-view version at entry. Instant human
+    reflux is applied before scoring: candidates already judged ``different``
+    leave the candidate pool entirely, while candidates judged ``same`` bypass
+    scoring and go straight into the human edge set. Parallel runs started at
+    the same view version therefore observe identical decision state.
     """
     batch = storage.get_batch(batch_id)
     if batch is None:
         raise LookupError(f"batch {batch_id!r} not found")
     records = _load_records(storage, batch_id)
     history = decision_dicts(storage, batch_id)
+    view_version = pin_version(storage, batch_id)
+    view_rows = view_at(storage, batch_id, view_version)
+    view_by_key = {row["pair_key"]: row for row in view_rows}
     run_id = _run_id(batch, config, history)
     started_at = clock.now_iso()
     timings: dict[str, float] = {}
@@ -68,8 +78,29 @@ def run_pipeline(
         candidates, blocking_stats = generate_candidates(records, config)
         mark("blocking")
 
-        scored_pairs: list[dict[str, Any]] = []
+        # Instant reflux at the candidate-pair boundary, before any scoring.
+        # Forced-same pairs skip the scored candidate pool but still receive an
+        # audit-only score below; the human verdict mandates the edge regardless
+        # of thresholds, so the score never decides anything.
+        forced_same: list[dict[str, Any]] = []
+        reflux_different: list[str] = []
+        open_candidates = []
         for pair in candidates:
+            verdict = view_by_key.get(pair.pair_key)
+            if verdict is None:
+                open_candidates.append(pair)
+            elif verdict["decision"] == "same":
+                forced_same.append(pair)
+            else:
+                reflux_different.append(pair.pair_key)
+
+        scored_pairs: list[dict[str, Any]] = []
+        forced_scores: dict[str, float] = {}
+        for pair in forced_same:
+            forced_scores[pair.pair_key] = score_pair(
+                pair.left, pair.right, config
+            )["score"]
+        for pair in open_candidates:
             result = score_pair(pair.left, pair.right, config)
             scored_pairs.append({
                 "pair_key": pair.pair_key,
@@ -93,11 +124,17 @@ def run_pipeline(
             for item in scored_pairs
             if item["zone"] == "match"
         ]
-        groups, applied_edges, conflicts = cluster_records(records, model_edges, history)
+        groups, applied_edges, conflicts = cluster_records(
+            records, model_edges, history
+        )
         pair_scores = {item["pair_key"]: item["score"] for item in scored_pairs}
         for edge in applied_edges:
-            if edge["kind"] == "human_same" and edge["pair_key"] in pair_scores:
+            if edge["kind"] != "human_same":
+                continue
+            if edge["pair_key"] in pair_scores:
                 edge["score"] = pair_scores[edge["pair_key"]]
+            elif edge["pair_key"] in forced_scores:
+                edge["score"] = forced_scores[edge["pair_key"]]
         mark("clustering")
 
         cluster_rows: list[dict[str, Any]] = []
@@ -111,6 +148,15 @@ def run_pipeline(
                 "golden": build_golden(group, config),
             })
         mark("golden")
+
+        reflux_stats = {
+            "decision_view_version": view_version,
+            "effective_decisions": len(view_rows),
+            "forced_same_edges": len(forced_same),
+            "excluded_different_pairs": len(reflux_different),
+            "excluded_pair_keys": reflux_different,
+        }
+        blocking_stats = {**blocking_stats, "decision_reflux": reflux_stats}
 
         run_common = {
             "run_id": run_id,
@@ -144,7 +190,7 @@ def run_pipeline(
         record_event(
             storage, clock, batch_id, run_id, "run_completed",
             {"candidate_pairs": len(scored_pairs), "clusters": len(cluster_rows),
-             "conflicts": len(conflicts)},
+             "conflicts": len(conflicts), "decision_view_version": view_version},
         )
     except Exception as exc:
         failed = {
@@ -164,6 +210,8 @@ def run_pipeline(
         "timings": timings,
         "blocking_stats": blocking_stats,
         "conflicts": conflicts,
+        "decision_view_version": view_version,
+        "reflux": reflux_stats,
         "clusters": [
             {"cluster_id": row["cluster_id"], "member_keys": row["member_keys"],
              "golden": row["golden"]}

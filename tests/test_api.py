@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 
 def _post_seed(client, seeded_paths):
     payload = seeded_paths[0].read_bytes()
@@ -77,7 +75,16 @@ def test_end_to_end_api_contract(client, seeded_paths):
         "reviewer": "qa", "note": "API contract",
     })
     assert decision.status_code == 201
-    assert decision.json()["run"]["run_id"] != run_id
+    payload = decision.json()
+    assert "run" not in payload
+    assert payload["decision"]["decision"] == "different"
+    assert payload["decision"]["view_version"] == 1
+    # Instant reflux: the pair leaves the review queue without a rerun.
+    queue_after = client.get("/review/next", params={"batch_id": "API", "n": 100}).json()
+    assert all(item["pair_key"] != pair["pair_key"] for item in queue_after["pairs"])
+    view = client.get("/review/view", params={"batch_id": "API"}).json()
+    assert view["view_version"] == 1
+    assert view["counts"] == {"same": 0, "different": 1}
     assert client.get("/review/decisions", params={"batch_id": "API"}).json()[0]["decision"] == "different"
 
     assert client.get("/batches/missing").status_code == 404
@@ -94,7 +101,7 @@ def test_end_to_end_api_contract(client, seeded_paths):
 
     deleted = client.delete("/batches/API")
     assert deleted.status_code == 200
-    assert deleted.json()["runs_removed"] >= 2
+    assert deleted.json()["runs_removed"] == 1
     assert client.get("/batches/API").status_code == 404
     assert client.get("/runs", params={"batch_id": "API"}).json() == []
 
@@ -151,3 +158,53 @@ def test_metrics_without_gold_labels_returns_conflict(client):
     run = client.post("/runs", json={"batch_id": "NOGOLD"}).json()
     response = client.get("/metrics/report", params={"run_id": run["run_id"]})
     assert response.status_code == 409
+
+
+def test_reflux_view_endpoint_and_immediate_queue_filter(client, seeded_paths):
+    payload = seeded_paths[0].read_bytes()
+    client.post(
+        "/batches?batch_id=REFLUX", content=payload,
+        headers={"content-type": "application/x-ndjson"},
+    )
+    run = client.post("/runs", json={"batch_id": "REFLUX"}).json()
+    baseline_candidates = run["candidate_pairs"]
+
+    assert client.get("/review/view", params={"batch_id": "REFLUX"}).json() == {
+        "batch_id": "REFLUX",
+        "view_version": 0,
+        "effective_count": 0,
+        "counts": {"same": 0, "different": 0},
+        "decisions": [],
+    }
+
+    queue = client.get("/review/next", params={"batch_id": "REFLUX", "n": 5}).json()
+    pair = queue["pairs"][0]
+    runs_before = len(client.get("/runs", params={"batch_id": "REFLUX"}).json())
+
+    submitted = client.post("/review/decisions", json={
+        "batch_id": "REFLUX", "pair_key": pair["pair_key"], "decision": "different",
+        "reviewer": "qa", "note": "no rerun expected",
+    })
+    assert submitted.status_code == 201
+    assert "run" not in submitted.json()
+    # The decision endpoint no longer triggers a pipeline run.
+    runs_after = client.get("/runs", params={"batch_id": "REFLUX"}).json()
+    assert len(runs_after) == runs_before
+
+    queue_after = client.get(
+        "/review/next", params={"batch_id": "REFLUX", "n": 100}
+    ).json()
+    assert all(item["pair_key"] != pair["pair_key"] for item in queue_after["pairs"])
+
+    view = client.get("/review/view", params={"batch_id": "REFLUX"}).json()
+    assert view["view_version"] == 1
+    assert view["effective_count"] == 1
+    assert view["counts"] == {"same": 0, "different": 1}
+
+    # The next explicit run reflects reflux in its counters.
+    next_run = client.post("/runs", json={"batch_id": "REFLUX"}).json()
+    assert next_run["candidate_pairs"] == baseline_candidates - 1
+    reflux = next_run["blocking_stats"]["decision_reflux"]
+    assert reflux["excluded_different_pairs"] == 1
+    assert reflux["decision_view_version"] == 1
+    assert client.get("/review/view", params={"batch_id": "missing"}).status_code == 404
