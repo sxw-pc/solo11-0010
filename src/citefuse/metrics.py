@@ -90,14 +90,15 @@ def evaluate_groups(
     }
 
 
-def _records(storage: Storage, batch_id: str) -> list[Record]:
-    return [record_from_db(row) for row in storage.list_records(batch_id)]
+def _records(storage: Storage, batch_id: str, run_id: str) -> list[Record]:
+    """Records visible to the run: its frozen snapshot, or the batch if legacy."""
+    return [record_from_db(row) for row in storage.list_run_records(run_id, batch_id)]
 
 
 def _threshold_groups(
     storage: Storage, config: AppConfig, batch_id: str, run_id: str, threshold: float
 ) -> tuple[list[Record], list[list[Record]]]:
-    records = _records(storage, batch_id)
+    records = _records(storage, batch_id, run_id)
     history = decision_dicts(storage, batch_id)
     edges = [
         {"pair_key": row["pair_key"], "rec_a_pk": row["rec_a_pk"],

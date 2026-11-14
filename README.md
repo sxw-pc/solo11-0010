@@ -93,14 +93,18 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `records` | `record_pk`, `(batch_id,source,record_id) UNIQUE`, `raw_json`, `norm_json`, 各归一列 | 原始值与归一值双份保存。 |
 | `dead_letters` | `line_no`, `reason`, `raw_text` | 逐行校验失败，不阻断整批。 |
 | `runs` | `run_id`, `config_hash`, 各计数, `timings_json`, `blocking_stats_json`, `status` | 一次逻辑运行的可复现快照。 |
+| `run_snapshots` / `run_records` | `run_id`, `record_pk` | 每个 run 冻结的记录引用集；并入不改动历史 run 的可见成员。 |
 | `run_attempts` | 与 `runs` 相同计数 + `started_at`, `finished_at` | 每次实际调用都追加一条审计尝试记录。 |
 | `pairs` | `pair_key`, 两记录主键, `score`, `zone`, `details_json` | 所有候选对的总分与分项得分明细。 |
 | `edges` | `pair_key`, `kind=model/human_same`, `score` | 实际参与聚类的匹配边。 |
 | `clusters` | `cluster_id`, `member_keys_json`, `golden_json` | 簇成员与字段级金记录。 |
 | `decisions` | `pair_key`, `decision`, `reviewer`, `note`, `submitted_at` | 人工裁定历史；同 pair 以提交时间/自增序号最新者为准。 |
 | `audit_events` | `run_id`, `event_type`, `detail_json`, `created_at` | 复核冲突、运行完成/失败等审计事件。 |
+| `batch_merges` | `batch_id`, 前后 `input_hash`, 并入计数 | 每次成功并入的审计行，不改变 `/batches` 的原有字段集。 |
 
 `run_id` 由批次内容哈希、配置哈希和裁定历史确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。
+
+每个 run 另存一份**记录快照**（`run_snapshots` + `run_records`，按 `run_id` 冻结当时读取到的 `record_pk` 集合）。此后即使批次被并入新记录，历史 run 的 clusters、edges、golden/export、复核队列和指标报告仍只返回当时那批成员与金记录；`GET /clusters?run_id=...`、`GET /golden/export?run_id=...` 等按 `run_id` 查询不会因批次 `input_hash` 变化而 404。快照方案与「给 records 加生效时间区间、按 run.created_at 反查」的取舍见 `pipeline.run_pipeline` 的注释。
 
 输入记录还可附带可选的评估字段 `gold_cluster`（fixture 自带）。它只用于 `GET /metrics/report` 与阈值扫描，绝不参与阻塞、打分或聚类。
 
@@ -111,7 +115,7 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | 方法 | 路径 | 入参 | 出参/说明 |
 |---|---|---|---|
 | GET | `/health` | — | 状态与配置哈希。 |
-| POST | `/batches` | JSONL 原始体，或 `{"jsonl":"...","batch_id":"...","name":"..."}`；可选 `?batch_id=&name=` | 201，批次统计、`inserted`、`duplicates`、`dead_added`。 |
+| POST | `/batches` | JSONL 原始体，或 `{"jsonl":"...","batch_id":"...","name":"..."}`；可选 `?batch_id=&name=`；并入既有批次时加 `?merge=true&batch_id=` | 201，批次统计、`inserted`、`duplicates`、`dead_added`；并入时另含 `merged:true`。标识冲突返回 409 及明细，并发并入冲突返回 409。 |
 | GET | `/batches` | — | 批次列表（含最新 run id）。 |
 | GET | `/batches/{id}` | — | 批次统计 + 死信样例；不存在 404。 |
 | DELETE | `/batches/{id}` | — | 级联删除记录、pairs、edges、clusters、runs、decisions、审计；404 若不存在。 |
@@ -206,6 +210,8 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 ## 7. 幂等、确定性与审计
 
 - 同一批次重复导入：内容哈希相同直接返回原批次，`inserted=0`；`(batch_id, source, record_id)` 唯一约束兜底。
+- **批次并入**（`POST /batches?merge=true&batch_id=...`）：把新 JSONL 追加进既有批次而不新建 `batch_id`，按业务标识 `(source, record_id)` 幂等。同标识且原始内容相同 → 跳过并计入 `duplicates`；同标识但内容不同 → 整次并入拒绝，返回 409 与逐条冲突明细（含 `existing`/`incoming` 原始值）；不同标识 → 追加，并更新 `total/valid/bad`。批次的 `input_hash` 改为按并入后批次**当前全量内容**（全部规范化记录的 canonical raw JSON + 死信）重算，与请求文件边界无关。成功并入另记一行 `batch_merges` 与 `batch_merged` 审计事件。此前已提交的人工裁定按 `pair_key`（由业务标识派生，不随自增主键漂移）继续复用；并入触发的下一次新 run 基于并入后的全量记录。
+- 并行安全：同一批次同时进入两个并入请求时，进程内按批次加锁使其中一个立即得到 409（`MergeInProgress`），另一个成功；写入后再次校验批次 `revision`，任何其他写入者造成的陈旧视图也以 409 拒绝，不会出现半截记录。并入的所有读写在一个 `BEGIN IMMEDIATE` 事务内完成，中途异常（含进程被终止）会整体回滚，批次计数与 records 保持并入前的状态。
 - 同一 batch + config + 裁定历史：`run_id` 相同，重跑重建完全一致的 pairs/edges/clusters/golden。
 - 每次实际调用追加 `run_attempts`，记录输入/坏行/候选对/边/簇/金记录数、各阶段耗时、状态、起止时间；`audit_events` 记录冲突与完成/失败。
 - 时间戳和耗时通过可注入 `Clock` 获取；测试使用 `FixedClock`。所有集合排序显式，JSON 使用排序键。
@@ -214,6 +220,7 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 
 ## 8. 已知局限
 
+- 并入是单进程内的互斥；citefuse 本身按单进程单文件 SQLite 部署，多进程同时写同一文件的场景不在支持范围。
 - 归一化在导入时完成；修改 `normalization` 配置后需重新导入批次（幂等以内容哈希为准）。
 - 单进程 SQLite，适合本地中小规模批次；阻塞桶内最坏 O(n²)，不做分布式/增量流式处理。
 - 不做跨语言、语义 embedding、作者机构消歧、DOI 联网校验。
@@ -261,5 +268,26 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=csv" -o data/gol
 # 级联删除
 curl -s -X DELETE 'http://127.0.0.1:8321/batches/DEMO'
 ```
+
+批次并入（既有 run 快照不受影响）：
+
+```bash
+# 先有一个基线 run（记下 RUN；上一步已生成）
+# 准备并入文件：一行与既有记录 (source, record_id) 完全相同，一行是新标识
+curl -s -X POST 'http://127.0.0.1:8321/batches?batch_id=DEMO&merge=true' \
+  -H 'Content-Type: application/x-ndjson' --data-binary @data/fixtures/records.jsonl
+# 再并入一个新记录（不同标识）：
+curl -s -X POST 'http://127.0.0.1:8321/batches?batch_id=DEMO&merge=true' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary $'{"record_id":"MERGE001","source":"ORBIT","title":"A brand new synthetic row"}\n'
+# 旧 run 的簇与金记录字节不变；trigger 新 run 后新记录进入成员
+curl -s "http://127.0.0.1:8321/clusters?run_id=$RUN"   # 仍为并入前的成员
+NEW_RUN=$(curl -s -X POST 'http://127.0.0.1:8321/runs' \
+  -H 'Content-Type: application/json' -d '{"batch_id":"DEMO"}' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')
+curl -s "http://127.0.0.1:8321/clusters?run_id=$NEW_RUN" | grep MERGE001
+```
+
+标识冲突（同标识不同内容）返回 409，`detail.conflicts` 列出每条冲突的 `source`/`record_id`/`existing`/`incoming`，且批次模型不变。并发并入同一批次时一个成功、另一个返回 409。
 
 验收关注点：`pytest` 全绿；fixture 200 条、120 个金标准簇；管道 F1 ≥ 0.90（默认实现为 1.0）；同一批次重复导入 `inserted=0`；同一 run 重跑簇/金记录逐行一致；复核裁定后重跑分裂/合并；阈值扫描与报告落盘；`data/reports/` 和 `data/citefuse.sqlite3` 为运行期产物且已被 `.gitignore` 忽略。

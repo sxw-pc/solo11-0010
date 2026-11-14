@@ -146,6 +146,128 @@ class RepositoryMixin:
             "SELECT * FROM clusters WHERE run_id=? AND cluster_id=?", (run_id, cluster_id)
         )
 
+    # -- frozen run record snapshots ----------------------------------------
+    def replace_run_snapshot(
+        self, run_id: str, record_pks: list[int], created_at: str
+    ) -> None:
+        """Persist the exact record set a run consumed, keyed by run_id.
+
+        Re-running the same logical run_id (same batch content, config and
+        decisions) rewrites an identical snapshot. A merge into the batch later
+        cannot change it.
+        """
+        with self.transaction() as conn:
+            self._write_run_snapshot(conn, run_id, record_pks, created_at)
+
+    def _write_run_snapshot(
+        self, conn: Any, run_id: str, record_pks: list[int], created_at: str
+    ) -> None:
+        conn.execute("DELETE FROM run_records WHERE run_id=?", (run_id,))
+        conn.execute(
+            """INSERT INTO run_snapshots(run_id,record_count,created_at)
+               VALUES(?,?,?)
+               ON CONFLICT(run_id) DO UPDATE SET
+                 record_count=excluded.record_count, created_at=excluded.created_at""",
+            (run_id, len(record_pks), created_at),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO run_records(run_id,record_pk) VALUES(?,?)",
+            [(run_id, int(pk)) for pk in record_pks],
+        )
+
+    def persist_run_outputs(
+        self,
+        run_id: str,
+        batch_id: str,
+        pairs: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        clusters: list[dict[str, Any]],
+        record_pks: list[int],
+        created_at: str,
+    ) -> None:
+        """Write every derived row for a run in one transaction.
+
+        Pairs, edges, clusters and the record snapshot become visible together.
+        A crash can therefore never leave a run whose clusters exist but whose
+        snapshot does not -- which would make it fall back to the live batch and
+        leak records merged after the run.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM pairs WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO pairs(run_id,pair_key,rec_a_pk,rec_b_pk,score,zone,
+                     strategies_json,details_json) VALUES(?,?,?,?,?,?,?,?)""",
+                [(run_id, p["pair_key"], p["rec_a_pk"], p["rec_b_pk"], p["score"],
+                  p["zone"], _dumps(p["strategies"]), _dumps(p["details"]))
+                 for p in pairs],
+            )
+            conn.execute("DELETE FROM edges WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO edges(run_id,pair_key,rec_a_pk,rec_b_pk,score,kind,
+                     details_json) VALUES(?,?,?,?,?,?,?)""",
+                [(run_id, e["pair_key"], e["rec_a_pk"], e["rec_b_pk"], e["score"],
+                  e["kind"], _dumps(e.get("details", {}))) for e in edges],
+            )
+            conn.execute("DELETE FROM clusters WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO clusters(run_id,cluster_id,batch_id,member_keys_json,
+                     member_pks_json,golden_json) VALUES(?,?,?,?,?,?)""",
+                [(run_id, c["cluster_id"], batch_id, _dumps(c["member_keys"]),
+                  _dumps(c["member_pks"]), _dumps(c["golden"])) for c in clusters],
+            )
+            self._write_run_snapshot(conn, run_id, record_pks, created_at)
+
+    def backfill_run_snapshots(self) -> int:
+        """Snapshot runs created before run_snapshots existed.
+
+        Runs this only while the database has no snapshots for a run. Since the
+        merge feature is new, any such run predates every merge, so the batch's
+        current records are exactly what that run saw.
+        """
+        rows = self.query(
+            """SELECT r.run_id, r.batch_id, r.created_at FROM runs r
+               LEFT JOIN run_snapshots s ON s.run_id = r.run_id
+               WHERE s.run_id IS NULL"""
+        )
+        for row in rows:
+            pks = [
+                int(record["record_pk"])
+                for record in self.query(
+                    "SELECT record_pk FROM records WHERE batch_id=?", (row["batch_id"],)
+                )
+            ]
+            self.replace_run_snapshot(row["run_id"], pks, row["created_at"])
+        return len(rows)
+
+    def list_run_record_pks(self, run_id: str) -> list[int] | None:
+        """Snapshot pks for a run, or None for legacy runs without a snapshot."""
+        snapshot = self.query_one(
+            "SELECT run_id FROM run_snapshots WHERE run_id=?", (run_id,)
+        )
+        if snapshot is None:
+            return None
+        return [
+            int(row["record_pk"])
+            for row in self.query(
+                "SELECT record_pk FROM run_records WHERE run_id=? ORDER BY record_pk",
+                (run_id,),
+            )
+        ]
+
+    def list_run_records(self, run_id: str, batch_id: str) -> list[sqlite3.Row]:
+        """Records visible to a run: its frozen set, or the batch for legacy runs."""
+        snapshot = self.query_one(
+            "SELECT run_id FROM run_snapshots WHERE run_id=?", (run_id,)
+        )
+        if snapshot is None:
+            return self.list_records(batch_id)
+        return self.query(
+            """SELECT r.* FROM run_records rr
+               JOIN records r ON r.record_pk = rr.record_pk
+               WHERE rr.run_id=? ORDER BY r.source,r.record_id""",
+            (run_id,),
+        )
+
     def add_decision(
         self, batch_id: str, pair_key: str, rec_a_key: str, rec_b_key: str,
         decision: str, reviewer: str, note: str, submitted_at: str,

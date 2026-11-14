@@ -10,8 +10,7 @@ from .blocking import generate_candidates
 from .clock import Clock
 from .clustering import cluster_records
 from .config import AppConfig
-from .models import Record, record_from_db
-from .review import decision_dicts
+from .models import record_from_db
 from .scoring import score_pair
 from .storage import Storage
 from .survivorship import build_golden
@@ -36,8 +35,9 @@ def _cluster_id(batch_id: str, member_keys: list[str]) -> str:
     return "cl_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _load_records(storage: Storage, batch_id: str) -> list[Record]:
-    return [record_from_db(row) for row in storage.list_records(batch_id)]
+def _decisions_from_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    """Same shape as review.decision_dicts, from rows read under one lock."""
+    return [dict(row) for row in rows]
 
 
 def run_pipeline(
@@ -47,12 +47,25 @@ def run_pipeline(
 
     Identical batch + config + decisions produce the same run_id and identical
     cluster/golden rows. Each invocation still appends a run_attempts audit row.
+
+    History snapshot choice: each run persists the exact ``record_pk`` set it
+    consumed (``run_snapshots``/``run_records``) instead of giving ``records``
+    valid-time intervals and resolving them by the run's ``created_at``.
+    Rationale: a snapshot is an unambiguous "these rows, no others" reference,
+    so reads stay simple and cannot drift. Time intervals would avoid a table,
+    but a merge and a pipeline run can interleave between timestamp reads, and
+    any clock skew or same-second boundary makes "which records were live at
+    created_at" ambiguous -- exactly the off-by-one that would corrupt a
+    historical run. The snapshot costs one small join per run and makes the
+    invariant local and provable. Legacy runs without a snapshot fall back to
+    the batch's current records.
     """
-    batch = storage.get_batch(batch_id)
-    if batch is None:
+    loaded = storage.load_batch_inputs(batch_id)
+    if loaded is None:
         raise LookupError(f"batch {batch_id!r} not found")
-    records = _load_records(storage, batch_id)
-    history = decision_dicts(storage, batch_id)
+    batch, record_rows, decision_rows = loaded
+    records = [record_from_db(row) for row in record_rows]
+    history = _decisions_from_rows(decision_rows)
     run_id = _run_id(batch, config, history)
     started_at = clock.now_iso()
     timings: dict[str, float] = {}
@@ -128,9 +141,10 @@ def run_pipeline(
             "created_at": started_at,
         }
         storage.save_run(run_common)
-        storage.replace_pairs(run_id, scored_pairs)
-        storage.replace_edges(run_id, applied_edges)
-        storage.replace_clusters(run_id, batch_id, cluster_rows)
+        storage.persist_run_outputs(
+            run_id, batch_id, scored_pairs, applied_edges, cluster_rows,
+            [record.pk for record in records], started_at,
+        )
         mark("persistence")
         timings["total"] = round(clock.monotonic() - start, 6)
         storage.save_run(run_common)

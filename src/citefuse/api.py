@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from starlette.concurrency import run_in_threadpool
 
 from .api_views import (
     batch_public, cluster_detail, cluster_summaries, export_golden, run_public,
@@ -19,12 +20,12 @@ from .api_views import (
 from .audit import run_events
 from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
-from .ingest import IngestError, ingest_jsonl
+from .ingest import IngestError, MergeConflictError, ingest_jsonl, merge_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
 from .models import DecisionRequest, RunRequest
 from .pipeline import run_pipeline
 from .review import decision_dicts, next_review_pairs, submit_decision
-from .storage import Storage
+from .storage import MergeInProgress, Storage
 
 
 def _resolve_run(storage: Storage, run_id: str | None, batch_id: str | None) -> str:
@@ -98,14 +99,44 @@ def create_app(
         request: Request,
         batch_id: str | None = Query(default=None),
         name: str | None = Query(default=None),
+        merge: bool = Query(default=False),
     ) -> dict[str, Any]:
         raw = await request.body()
         if request.headers.get("content-type", "").startswith("application/json"):
             raw, envelope_id, envelope_name = _parse_envelope(raw)
             batch_id = batch_id or envelope_id
             name = name or envelope_name
+        if merge:
+            if not batch_id:
+                raise HTTPException(400, "batch_id is required when merge=true")
+            try:
+                # Merging does blocking SQLite work. Running it in a worker
+                # thread keeps the event loop free so two overlapping merge
+                # requests genuinely overlap and the per-batch merge guard can
+                # reject the second one.
+                return await run_in_threadpool(
+                    merge_jsonl, storage, config, active_clock, raw, batch_id
+                )
+            except MergeInProgress as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except MergeConflictError as exc:
+                raise HTTPException(
+                    409,
+                    {
+                        "message": str(exc),
+                        "batch_id": exc.batch_id,
+                        "conflicts": exc.conflicts,
+                    },
+                    headers={"x-citefuse-merge": "conflict"},
+                ) from exc
+            except LookupError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except IngestError as exc:
+                raise HTTPException(400, str(exc)) from exc
         try:
             return ingest_jsonl(storage, config, active_clock, raw, batch_id, name)
+        except MergeInProgress as exc:
+            raise HTTPException(409, str(exc)) from exc
         except IngestError as exc:
             raise HTTPException(400, str(exc)) from exc
 

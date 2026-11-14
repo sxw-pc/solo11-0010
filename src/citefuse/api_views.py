@@ -12,6 +12,10 @@ from .storage import Storage
 
 def batch_public(storage: Storage, row: Any, include_dead: bool = False) -> dict[str, Any]:
     payload = dict(row)
+    # Internal bookkeeping for in-place re-ingest detection; not part of the
+    # documented /batches response contract.
+    payload.pop("ingest_hash", None)
+    payload.pop("revision", None)
     payload["latest_run_id"] = storage.latest_run_id(row["batch_id"])
     if include_dead:
         payload["dead_letters"] = [
@@ -71,17 +75,31 @@ def cluster_summaries(storage: Storage, run_id: str) -> list[dict[str, Any]]:
     return output
 
 
+def _member_records(storage: Storage, member_pks: set[int]):
+    """Resolve a cluster's frozen member records.
+
+    Cluster membership is stored by pk. Those pks are immutable, so resolving
+    them against the batch is correct even if the batch later merges more
+    records -- and it is the only option for a run that predates snapshots.
+    Records are never deleted except by a cascade delete of the whole batch.
+    """
+    if not member_pks:
+        return []
+    placeholders = ",".join("?" for _ in member_pks)
+    rows = storage.query(
+        f"SELECT * FROM records WHERE record_pk IN ({placeholders})"
+        " ORDER BY source,record_id",
+        tuple(sorted(member_pks)),
+    )
+    return [record_from_db(row) for row in rows]
+
+
 def cluster_detail(storage: Storage, run_id: str, cluster_id: str) -> dict[str, Any]:
     cluster = storage.get_cluster(run_id, cluster_id)
     if cluster is None:
         raise LookupError(f"cluster {cluster_id!r} not found in run {run_id!r}")
     member_pks = set(json.loads(cluster["member_pks_json"]))
-    member_rows = storage.query(
-        f"SELECT * FROM records WHERE record_pk IN ({','.join('?' for _ in member_pks)})"
-        " ORDER BY source,record_id",
-        tuple(sorted(member_pks)),
-    ) if member_pks else []
-    records = [record_from_db(row) for row in member_rows]
+    records = _member_records(storage, member_pks)
     key_by_pk = {record.pk: record.key for record in records}
     edges = []
     for edge in storage.list_edges(run_id):
