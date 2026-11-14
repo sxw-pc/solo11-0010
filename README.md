@@ -108,6 +108,8 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 
 服务固定绑定 `127.0.0.1`，默认 `8321`。所有响应均为 JSON（金记录导出除外）。逐行坏 JSONL 会进入死信并仍返回 201；空请求、非法 UTF-8、非法 JSON envelope 返回 400。
 
+摄取幂等与计数约定：相同内容（按 `input_hash`）重复提交一律返回既有批次（`created=false`，不产生重复行），与使用哪个 `batch_id` 无关，并发重复上传也只会有一个批次被创建；同一 `batch_id` 提交不同内容返回 400。行统计满足 `valid_lines + bad_lines = total_lines`（空白分隔行不计；重复记录行属于 valid），无末尾换行的文件同样按此计数。任何单行处理失败（坏 JSON、schema、归一化等）只进 `dead_letters`（含行号与原因），不阻断整批。
+
 | 方法 | 路径 | 入参 | 出参/说明 |
 |---|---|---|---|
 | GET | `/health` | — | 状态与配置哈希。 |

@@ -151,3 +151,40 @@ def test_metrics_without_gold_labels_returns_conflict(client):
     run = client.post("/runs", json={"batch_id": "NOGOLD"}).json()
     response = client.get("/metrics/report", params={"run_id": run["run_id"]})
     assert response.status_code == 409
+
+
+def test_api_duplicate_upload_returns_existing_batch(client, tiny_payload):
+    headers = {"content-type": "application/x-ndjson"}
+    first = client.post("/batches?batch_id=DUP", content=tiny_payload, headers=headers)
+    assert first.status_code == 201
+    assert first.json()["created"] is True
+
+    again = client.post("/batches?batch_id=DUP", content=tiny_payload, headers=headers)
+    assert again.status_code == 201
+    assert again.json()["created"] is False
+    assert again.json()["inserted"] == 0
+
+    other_id = client.post("/batches?batch_id=OTHER", content=tiny_payload, headers=headers)
+    assert other_id.status_code == 201
+    assert other_id.json()["created"] is False
+    assert other_id.json()["batch_id"] == "DUP"
+
+    envelope = client.post(
+        "/batches",
+        json={"jsonl": tiny_payload.decode("utf-8"), "batch_id": "ENV2"},
+    )
+    assert envelope.status_code == 201
+    assert envelope.json()["created"] is False
+    assert envelope.json()["batch_id"] == "DUP"
+
+    batches = client.get("/batches").json()
+    assert len(batches) == 1
+    detail = client.get("/batches/DUP").json()
+    assert detail["total_lines"] == detail["valid_lines"] + detail["bad_lines"]
+
+    conflict = client.post(
+        "/batches?batch_id=DUP",
+        content=b'{"record_id":"Z","source":"S","title":"Other content"}\n',
+        headers=headers,
+    )
+    assert conflict.status_code == 400

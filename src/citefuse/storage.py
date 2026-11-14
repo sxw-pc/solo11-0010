@@ -17,11 +17,12 @@ from .repository import RepositoryMixin
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
-  batch_id TEXT PRIMARY KEY, name TEXT, input_hash TEXT NOT NULL,
+  batch_id TEXT PRIMARY KEY, name TEXT, input_hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   total_lines INTEGER NOT NULL DEFAULT 0, valid_lines INTEGER NOT NULL DEFAULT 0,
   bad_lines INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'ingested'
 );
+CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(input_hash);
 CREATE TABLE IF NOT EXISTS records (
   record_pk INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -106,10 +107,14 @@ class Storage(RepositoryMixin):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
+        self._tx_depth = 0
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # Wait for a competing writer (e.g. a second process) instead of
+        # failing immediately with "database is locked".
+        self.conn.execute("PRAGMA busy_timeout=5000")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
 
@@ -119,13 +124,26 @@ class Storage(RepositoryMixin):
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Re-entrant unit of work guarded by the app-wide lock.
+
+        Nested ``transaction()``/``execute()`` calls join the outer unit of
+        work: only the outermost level commits on success or rolls back on
+        error. An exception escaping a nested level propagates without touching
+        the transaction state, so callers may catch it (SQLite has already
+        rolled the failed statement back) and continue the outer unit.
+        """
         with self._lock:
+            self._tx_depth += 1
             try:
                 yield self.conn
-                self.conn.commit()
+                if self._tx_depth == 1:
+                    self.conn.commit()
             except Exception:
-                self.conn.rollback()
+                if self._tx_depth == 1:
+                    self.conn.rollback()
                 raise
+            finally:
+                self._tx_depth -= 1
 
     def execute(self, sql: str, args: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         with self.transaction() as conn:
@@ -157,6 +175,14 @@ class Storage(RepositoryMixin):
 
     def get_batch(self, batch_id: str) -> sqlite3.Row | None:
         return self.query_one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))
+
+    def get_batch_by_hash(self, input_hash: str) -> sqlite3.Row | None:
+        """Return the batch stored for identical content, if one exists."""
+        return self.query_one(
+            "SELECT * FROM batches WHERE input_hash=?"
+            " ORDER BY created_at, batch_id LIMIT 1",
+            (input_hash,),
+        )
 
     def list_batches(self) -> list[sqlite3.Row]:
         return self.query("SELECT * FROM batches ORDER BY created_at, batch_id")
