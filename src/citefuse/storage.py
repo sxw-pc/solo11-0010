@@ -84,9 +84,46 @@ CREATE TABLE IF NOT EXISTS decisions (
   batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
   pair_key TEXT NOT NULL, rec_a_key TEXT NOT NULL, rec_b_key TEXT NOT NULL,
   decision TEXT NOT NULL, reviewer TEXT NOT NULL, note TEXT NOT NULL,
-  submitted_at TEXT NOT NULL
+  submitted_at TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'batch',
+  status TEXT NOT NULL DEFAULT 'active'
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_batch ON decisions(batch_id, pair_key);
+-- Cross-batch decisions live in their own global table so they survive the
+-- deletion/rebuild of the source batch. A partial unique index enforces that
+-- exactly one active decision exists per pair_key, even under concurrent
+-- submissions from different batches (the losing INSERT fails at the DB level).
+CREATE TABLE IF NOT EXISTS cross_batch_decisions (
+  decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id TEXT NOT NULL,
+  pair_key TEXT NOT NULL, rec_a_key TEXT NOT NULL, rec_b_key TEXT NOT NULL,
+  rec_a_fingerprint TEXT NOT NULL, rec_b_fingerprint TEXT NOT NULL,
+  decision TEXT NOT NULL, reviewer TEXT NOT NULL, note TEXT NOT NULL,
+  submitted_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+);
+CREATE INDEX IF NOT EXISTS idx_cross_pair ON cross_batch_decisions(pair_key, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cross_active_pair
+  ON cross_batch_decisions(pair_key) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_cross_submitted
+  ON cross_batch_decisions(submitted_at, decision_id);
+-- Frozen per-batch inheritance snapshot. Rows are written only by a pipeline
+-- run and are the sole inheritance input when the batch is rerun, so later
+-- cross-batch submissions can never alter an older batch's reproducible
+-- pairs/clusters/golden. No FK to cross_batch_decisions on purpose: the
+-- snapshot must outlive supersession and source-batch deletion.
+CREATE TABLE IF NOT EXISTS decision_inheritances (
+  inheritance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  source_decision_id INTEGER NOT NULL,
+  source_batch_id TEXT NOT NULL,
+  pair_key TEXT NOT NULL, rec_a_key TEXT NOT NULL, rec_b_key TEXT NOT NULL,
+  rec_a_fingerprint TEXT NOT NULL, rec_b_fingerprint TEXT NOT NULL,
+  decision TEXT NOT NULL, submitted_at TEXT NOT NULL,
+  inherited_at TEXT NOT NULL,
+  UNIQUE(batch_id, pair_key)
+);
+CREATE INDEX IF NOT EXISTS idx_inherit_batch ON decision_inheritances(batch_id);
 CREATE TABLE IF NOT EXISTS audit_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT, batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -94,6 +131,20 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON audit_events(run_id);
 """
+
+# Additive upgrades for databases created before cross-batch review support.
+# Every added column has a default, so pre-existing rows keep working with no
+# data migration and retain their original batch-scoped semantics.
+_SCHEMA_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "decisions": (
+        ("scope", "ALTER TABLE decisions ADD COLUMN scope TEXT NOT NULL DEFAULT 'batch'"),
+        ("status", "ALTER TABLE decisions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+    ),
+    "runs": (
+        ("inheritance_json",
+         "ALTER TABLE runs ADD COLUMN inheritance_json TEXT NOT NULL DEFAULT '[]'"),
+    ),
+}
 
 
 def json_dumps(value: Any) -> str:
@@ -106,12 +157,24 @@ class Storage(RepositoryMixin):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=5.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # Multiple worker processes may open the same SQLite file; make
+        # writers wait on the WAL write lock instead of failing immediately.
+        self.conn.execute("PRAGMA busy_timeout=5000")
         with self.transaction() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Apply additive column upgrades to pre-existing databases."""
+        for table, columns in _SCHEMA_MIGRATIONS.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, statement in columns:
+                if column not in existing:
+                    conn.execute(statement)
 
     def close(self) -> None:
         with self._lock:

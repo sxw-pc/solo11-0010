@@ -21,9 +21,15 @@ from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
 from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
-from .models import DecisionRequest, RunRequest
+from .models import DecisionRequest, RunRequest, SCOPE_CROSS_BATCH
 from .pipeline import run_pipeline
-from .review import decision_dicts, next_review_pairs, submit_decision
+from .review import (
+    cross_decision_dicts,
+    decision_dicts,
+    next_review_pairs,
+    submit_decision,
+)
+from .repository import DecisionConflict
 from .storage import Storage
 
 
@@ -50,6 +56,7 @@ def _pipeline_public(result: dict[str, Any]) -> dict[str, Any]:
         "run_id", "batch_id", "config_hash", "input_rows", "bad_rows",
         "candidate_pairs", "matched_edges", "cluster_count", "golden_count",
         "timings", "blocking_stats", "status", "conflicts",
+        "inherited_decisions", "inheritance_mismatches",
     ]
     return {key: result.get(key) for key in keys}
 
@@ -177,9 +184,20 @@ def create_app(
         try:
             decision = submit_decision(
                 storage, active_clock, body.batch_id, body.pair_key,
-                body.decision, body.reviewer, body.note,
+                body.decision, body.reviewer, body.note, body.scope,
             )
             rebuilt = run_pipeline(storage, config, active_clock, body.batch_id)
+        except DecisionConflict as exc:
+            # Concurrent mutually exclusive cross-batch submission: the
+            # database's partial unique index kept exactly one effective row.
+            raise HTTPException(
+                409,
+                {
+                    "error": "cross_batch_decision_conflict",
+                    "pair_key": exc.pair_key,
+                    "effective_decision": exc.winner,
+                },
+            ) from exc
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
@@ -192,7 +210,16 @@ def create_app(
             raise HTTPException(400, "batch_id is required")
         if storage.get_batch(batch_id) is None:
             raise HTTPException(404, f"batch {batch_id!r} not found")
-        return [dict(row) for row in decision_dicts(storage, batch_id)]
+        rows = decision_dicts(storage, batch_id)
+        # Cross-batch decisions submitted by this batch are part of its
+        # review history; inherited decisions arriving from other batches
+        # remain visible via /runs and the frozen inheritance table.
+        for row in cross_decision_dicts(storage, batch_id):
+            item = dict(row)
+            item["scope"] = SCOPE_CROSS_BATCH
+            rows.append(item)
+        rows.sort(key=lambda item: (item["submitted_at"], item["decision_id"]))
+        return rows
 
     @app.get("/metrics/report")
     def metrics_report(run_id: str) -> dict[str, Any]:

@@ -97,10 +97,12 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `pairs` | `pair_key`, 两记录主键, `score`, `zone`, `details_json` | 所有候选对的总分与分项得分明细。 |
 | `edges` | `pair_key`, `kind=model/human_same`, `score` | 实际参与聚类的匹配边。 |
 | `clusters` | `cluster_id`, `member_keys_json`, `golden_json` | 簇成员与字段级金记录。 |
-| `decisions` | `pair_key`, `decision`, `reviewer`, `note`, `submitted_at` | 人工裁定历史；同 pair 以提交时间/自增序号最新者为准。 |
-| `audit_events` | `run_id`, `event_type`, `detail_json`, `created_at` | 复核冲突、运行完成/失败等审计事件。 |
+| `decisions` | `pair_key`, `decision`, `reviewer`, `note`, `submitted_at`, `scope`, `status` | 批次内人工裁定历史；同 pair 以提交时间/自增序号最新者为准。`scope` 默认 `batch`，历史行无需迁移。 |
+| `cross_batch_decisions` | `pair_key`, 两侧业务 key 与内容指纹, `decision`, `source_batch_id`, `status` | 显式标记为跨批次的全局裁定；与批次生命周期解耦，源批次删除后仍存活。部分唯一索引保证每个 `pair_key` 至多一条 `active`。 |
+| `decision_inheritances` | `batch_id`, `source_decision_id`, `source_batch_id`, `pair_key`, 指纹, `decision` | 每个批次首次跑管道时冻结的继承快照；重跑只读快照，保证老批次结果不被后续全局裁定污染。 |
+| `audit_events` | `run_id`, `event_type`, `detail_json`, `created_at` | 复核冲突、继承命中/身份不匹配、运行完成/失败等审计事件。 |
 
-`run_id` 由批次内容哈希、配置哈希和裁定历史确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。
+`run_id` 由批次内容哈希、配置哈希、有效裁定历史（含冻结继承快照）确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。继承快照只在批次首次运行时冻结，之后新增的跨批次裁定不会改变老批次的 `run_id` 与任何已落库结果。
 
 输入记录还可附带可选的评估字段 `gold_cluster`（fixture 自带）。它只用于 `GET /metrics/report` 与阈值扫描，绝不参与阻塞、打分或聚类。
 
@@ -115,12 +117,12 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | GET | `/batches` | — | 批次列表（含最新 run id）。 |
 | GET | `/batches/{id}` | — | 批次统计 + 死信样例；不存在 404。 |
 | DELETE | `/batches/{id}` | — | 级联删除记录、pairs、edges、clusters、runs、decisions、审计；404 若不存在。 |
-| POST | `/runs` | `{"batch_id":"..."}` | 201，跑完整管道并返回 run 摘要、阻塞统计、冲突审计。 |
-| GET | `/runs` | `?batch_id=` | 运行列表。 |
+| POST | `/runs` | `{"batch_id":"..."}` | 201，跑完整管道并返回 run 摘要、阻塞统计、冲突审计、`inherited_decisions`（含来源批次）与 `inheritance_mismatches`。 |
+| GET | `/runs` | `?batch_id=` | 运行列表，每个 run 带 `inheritances` 继承摘要。 |
 | GET | `/runs/{run_id}` | — | 运行详情、最近一次尝试耗时、审计事件。 |
-| GET | `/review/next` | `?n=10&batch_id=` | 最新 run 中未裁定的灰区 pair，含双记录、总分、分项、策略。 |
-| POST | `/review/decisions` | `{"batch_id","pair_key","decision":"same\|different","reviewer","note"}` | 持久化裁定并**自动重跑**；返回新 run 摘要。 |
-| GET | `/review/decisions` | `?batch_id=` | 裁定历史。 |
+| GET | `/review/next` | `?n=10&batch_id=` | 最新 run 中未裁定的灰区 pair，含双记录、总分、分项、策略；身份对不上的历史跨批次裁定以 `historical_decision` 标注并保留在队列。 |
+| POST | `/review/decisions` | `{"batch_id","pair_key","decision":"same\|different","reviewer","note","scope":"batch\|cross_batch"}` | 持久化裁定并**自动重跑**；`scope` 省略时默认 `batch`。跨批次互斥并发提交时仅一条生效，落败方收到 409。 |
+| GET | `/review/decisions` | `?batch_id=` | 批次内裁定历史，含本批次提交的跨批次裁定。 |
 | GET | `/metrics/report` | `?run_id=` | pairwise P/R/F1、簇完全一致率；写 `data/reports/{run_id}.json`。 |
 | GET | `/metrics/thresholds` | `?run_id=&grid=0.5,0.6,...` | 复用已落库分数做阈值扫描，不重跑归一化/阻塞；写扫描报告。 |
 | GET | `/clusters` | `?run_id=` 或 `?batch_id=` | 簇摘要与金记录。 |
@@ -191,6 +193,27 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 模型边不能违反禁连边，即使可通过其他记录传递；若人工 `same` 与更新的 `different` 冲突，按提交时间/自增序号由新裁定胜出，并写 `review_conflict` 审计事件。
 - 并查集按 rank 合并，最终簇按最小成员 key 排序；输出与输入顺序无关。
 
+### 跨批次裁定作用域与继承
+
+人工裁定有两种作用域，提交时通过 `scope` 显式选择，缺省为 `batch`：
+
+- **`batch`（默认）**：写入 `decisions`，只在提交批次内生效，行为与历史版本完全一致；升级前的旧数据无需迁移，自动按批次作用域继续生效。
+- **`cross_batch`**：写入全局表 `cross_batch_decisions`，可被后续批次继承。它与批次生命周期解耦——源批次被删除重建后，裁定行仍然保留。
+
+继承匹配不是只看 `pair_key` 字符串，而是同时校验三重业务身份：
+
+1. 候选对的 `pair_key` 与裁定记录一致；
+2. 两侧业务标识（`source::record_id` 规范序）与裁定的 `rec_a_key`/`rec_b_key` 一致；
+3. 两侧记录的归一化内容指纹（SHA-256）与裁定保存的指纹一致。
+
+任一条件不满足（典型场景：批次删除后用同名 `record_id` 重建了内容不同的记录，`pair_key` 被复用），都不会盲目继承。该 pair 回落为新的灰区对，在 `/review/next` 中带 `historical_decision`（含 `mismatch_reason` 与来源批次），并写 `inheritance_identity_mismatch` 审计事件。
+
+**冻结与可复现**：批次首次运行管道时，把当时命中的跨批次裁定物化为 `decision_inheritances` 快照。之后该批次重跑只读快照，全局表后续新增或被取代的裁定都无法改写它的 pairs/edges/clusters/golden，`run_id` 保持不变，金记录导出逐字节一致。本批次自己提交的跨批次裁定走独立的 own-cross 通道（不进冻结表），每次运行重新校验身份，因此同名重建后同样受指纹保护。
+
+**优先级**：本地批次裁定 > 本批次提交的跨批次裁定 > 冻结的外来继承裁定。
+
+**并发与互斥**：`cross_batch_decisions` 上建有部分唯一索引 `(pair_key) WHERE status='active'`，数据库层保证同一 `pair_key` 同时只有一条有效跨批次裁定。两个批次近乎同时提交互斥裁定时，一条原子取代旧裁定生效，另一条在唯一索引上失败并回滚到保存点，返回 409 并携带胜出裁定，绝不会出现两个批次各自认为自己的裁定生效。被取代的行保留为 `status='superseded'` 以留存完整审计轨迹。
+
 ### 金记录幸存规则
 
 | 规则 | 默认字段 | 行为 |
@@ -211,6 +234,8 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 时间戳和耗时通过可注入 `Clock` 获取；测试使用 `FixedClock`。所有集合排序显式，JSON 使用排序键。
 - 配置 SHA-256 写入 `runs.config_hash` 和指标报告；报告位于 `data/reports/{run_id}.json` 与 `{run_id}_thresholds.json`。
 - 指标：pairwise TP/FP/FN 基于金标准簇；簇级完全一致率 = 与某个金标准簇成员集合完全相同的预测簇数 / 有金标签的预测簇数。阈值扫描仅复用 `pairs.score`，不重跑归一化或阻塞。
+- 指标报告按**当前有效裁定**（本地 + own-cross + 冻结继承）即时重算聚类，是评估视图，不读写该 run 已冻结的 `clusters`/`edges`；因此在 run 落库后新增的裁定会反映在新报告里，但不会改变该 run 的 `run_id` 与已存储结果。
+- 并发：进程内由可重入锁串行化所有读写；跨进程共用同一 SQLite 文件时依赖 WAL 与 `busy_timeout=5000` 等待写锁，跨批次裁定的互斥性最终由部分唯一索引在数据库层保证，锁等待超时也会回落为 409 冲突响应。
 
 ## 8. 已知局限
 
@@ -251,6 +276,13 @@ curl -s "http://127.0.0.1:8321/review/next?batch_id=DEMO&n=1"
 curl -s -X POST 'http://127.0.0.1:8321/review/decisions' \
   -H 'Content-Type: application/json' \
   -d '{"batch_id":"DEMO","pair_key":"PAIR_KEY_HERE","decision":"different","reviewer":"reviewer-1","note":"different trial"}'
+
+# 显式提交一条可跨批次复用的裁定（scope 省略时默认为 batch）
+curl -s -X POST 'http://127.0.0.1:8321/review/decisions' \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"DEMO","pair_key":"PAIR_KEY_HERE","decision":"same","scope":"cross_batch","note":"reusable for later monthly exports"}'
+# 后续批次首次跑 /runs 后，该 pair 不再出现在它的 /review/next；
+# /runs 的 inheritances 字段可查到来源批次 DEMO。
 
 # 指标、阈值扫描、导出
 curl -s "http://127.0.0.1:8321/metrics/report?run_id=$RUN"

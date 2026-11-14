@@ -9,7 +9,7 @@ from typing import Any
 from .clustering import cluster_records
 from .config import AppConfig
 from .models import Record, record_from_db
-from .review import decision_dicts
+from .review import effective_decision_history
 from .storage import Storage
 
 
@@ -98,7 +98,7 @@ def _threshold_groups(
     storage: Storage, config: AppConfig, batch_id: str, run_id: str, threshold: float
 ) -> tuple[list[Record], list[list[Record]]]:
     records = _records(storage, batch_id)
-    history = decision_dicts(storage, batch_id)
+    history, _dropped = effective_decision_history(storage, batch_id)
     edges = [
         {"pair_key": row["pair_key"], "rec_a_pk": row["rec_a_pk"],
          "rec_b_pk": row["rec_b_pk"], "score": row["score"]}

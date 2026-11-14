@@ -24,6 +24,7 @@ def run_public(storage: Storage, row: Any) -> dict[str, Any]:
     payload = dict(row)
     payload["timings"] = json.loads(payload.pop("timings_json"))
     payload["blocking_stats"] = json.loads(payload.pop("blocking_stats_json"))
+    payload["inheritances"] = json.loads(payload.pop("inheritance_json", "[]") or "[]")
     attempt = storage.latest_attempt(row["run_id"])
     count = storage.query_one(
         "SELECT COUNT(*) AS n FROM run_attempts WHERE run_id=?", (row["run_id"],)

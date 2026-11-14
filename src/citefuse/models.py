@@ -1,6 +1,7 @@
 """Core data models shared by the ingestion, pipeline and API layers."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -11,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PAIR_SEPARATOR = "||"
 KEY_SEPARATOR = "::"
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+SCOPE_BATCH = "batch"
+SCOPE_CROSS_BATCH = "cross_batch"
+DECISION_SCOPES = (SCOPE_BATCH, SCOPE_CROSS_BATCH)
 
 
 class RawRecord(BaseModel):
@@ -72,6 +77,8 @@ class DecisionRequest(BaseModel):
     decision: Literal["same", "different"]
     reviewer: str = Field(default="anonymous", min_length=1, max_length=100)
     note: str = Field(default="", max_length=2000)
+    # Defaults to batch-scoped: omitting it preserves the legacy contract.
+    scope: Literal["batch", "cross_batch"] = SCOPE_BATCH
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,18 @@ class Record:
     @property
     def key(self) -> str:
         return make_record_key(self.source, self.record_id)
+
+    @property
+    def fingerprint(self) -> str:
+        """Content-derived business identity of this record.
+
+        Cross-batch inheritance requires the two business records behind a
+        pair_key to still be the same records, not just the same source/id
+        strings after a delete-and-rebuild cycle. The fingerprint covers the
+        normalized bibliographic content (plus business key) and excludes
+        batch-scoped plumbing (record_pk, line_no).
+        """
+        return record_fingerprint(self.source, self.record_id, self.norm)
 
     @property
     def title(self) -> str:
@@ -128,6 +147,22 @@ class Record:
 
 def make_record_key(source: str, record_id: str) -> str:
     return f"{source}{KEY_SEPARATOR}{record_id}"
+
+
+def record_fingerprint(source: str, record_id: str, norm: dict[str, Any]) -> str:
+    """Stable SHA-256 fingerprint of a record's business identity."""
+    material = json.dumps(
+        {"source": source, "record_id": record_id, "norm": norm},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def row_fingerprint(row: Any) -> str:
+    """Fingerprint for a raw sqlite records row (or dict)."""
+    return record_fingerprint(
+        row["source"], row["record_id"], json.loads(row["norm_json"])
+    )
 
 
 def pair_order(key: str) -> tuple[str, str]:

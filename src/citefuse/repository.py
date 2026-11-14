@@ -6,6 +6,22 @@ import sqlite3
 from typing import Any
 
 
+class DecisionConflict(LookupError):
+    """Raised when a concurrent cross-batch decision wins the same pair_key.
+
+    The partial unique index on cross_batch_decisions is the hard guarantee;
+    this exception carries the winning row so callers can report it.
+    """
+
+    def __init__(self, pair_key: str, winner: dict[str, Any]) -> None:
+        super().__init__(
+            f"pair_key {pair_key!r} already has an effective cross-batch decision "
+            f"({winner['decision']} from batch {winner['source_batch_id']!r})"
+        )
+        self.pair_key = pair_key
+        self.winner = winner
+
+
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -21,8 +37,8 @@ class RepositoryMixin:
         self.execute(
             """INSERT INTO runs(run_id,batch_id,config_hash,input_rows,bad_rows,
                  candidate_pairs,matched_edges,cluster_count,golden_count,
-                 timings_json,blocking_stats_json,status,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 timings_json,blocking_stats_json,status,created_at,inheritance_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(run_id) DO UPDATE SET
                  input_rows=excluded.input_rows,bad_rows=excluded.bad_rows,
                  candidate_pairs=excluded.candidate_pairs,
@@ -30,11 +46,13 @@ class RepositoryMixin:
                  cluster_count=excluded.cluster_count,golden_count=excluded.golden_count,
                  timings_json=excluded.timings_json,
                  blocking_stats_json=excluded.blocking_stats_json,
-                 status=excluded.status""",
+                 status=excluded.status,
+                 inheritance_json=excluded.inheritance_json""",
             (run["run_id"], run["batch_id"], run["config_hash"], run["input_rows"],
              run["bad_rows"], run["candidate_pairs"], run["matched_edges"],
              run["cluster_count"], run["golden_count"], _dumps(run["timings"]),
-             _dumps(run["blocking_stats"]), run["status"], run["created_at"]),
+             _dumps(run["blocking_stats"]), run["status"], run["created_at"],
+             _dumps(run.get("inheritances", []))),
         )
 
     def add_attempt(self, attempt: dict[str, Any]) -> None:
@@ -69,6 +87,20 @@ class RepositoryMixin:
     def latest_run_id(self, batch_id: str) -> str | None:
         row = self.query_one(
             "SELECT run_id FROM run_attempts WHERE batch_id=? ORDER BY attempt_id DESC LIMIT 1",
+            (batch_id,),
+        )
+        return str(row["run_id"]) if row else None
+
+    def latest_completed_run_id(self, batch_id: str) -> str | None:
+        """Newest *successful* run id.
+
+        A failed first attempt writes a ``runs``/``run_attempts`` row but must
+        not freeze the inheritance snapshot: gating on completed runs lets a
+        retry after a blocking/scoring failure still resolve global decisions.
+        """
+        row = self.query_one(
+            "SELECT run_id FROM runs WHERE batch_id=? AND status='completed' "
+            "ORDER BY created_at DESC, run_id DESC LIMIT 1",
             (batch_id,),
         )
         return str(row["run_id"]) if row else None
@@ -165,5 +197,69 @@ class RepositoryMixin:
             )
         return self.query(
             "SELECT * FROM decisions WHERE batch_id=? ORDER BY submitted_at,decision_id",
+            (batch_id,),
+        )
+
+    # -- cross-batch decisions and frozen inheritance ------------------------
+    def get_active_cross_decision(self, pair_key: str) -> sqlite3.Row | None:
+        return self.query_one(
+            "SELECT * FROM cross_batch_decisions WHERE pair_key=? AND status='active'",
+            (pair_key,),
+        )
+
+    def list_active_cross_decisions(
+        self, pair_keys: list[str] | None = None
+    ) -> list[sqlite3.Row]:
+        if pair_keys is None:
+            return self.query(
+                "SELECT * FROM cross_batch_decisions WHERE status='active' "
+                "ORDER BY submitted_at,decision_id"
+            )
+        if not pair_keys:
+            return []
+        placeholders = ",".join("?" for _ in pair_keys)
+        return self.query(
+            f"SELECT * FROM cross_batch_decisions WHERE status='active' "
+            f"AND pair_key IN ({placeholders}) ORDER BY submitted_at,decision_id",
+            tuple(pair_keys),
+        )
+
+    def list_cross_decision_history(
+        self, source_batch_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        if source_batch_id is None:
+            return self.query(
+                "SELECT * FROM cross_batch_decisions ORDER BY submitted_at,decision_id"
+            )
+        return self.query(
+            "SELECT * FROM cross_batch_decisions WHERE source_batch_id=? "
+            "ORDER BY submitted_at,decision_id",
+            (source_batch_id,),
+        )
+
+    def replace_inheritances(
+        self, batch_id: str, inherited_at: str, pins: list[dict[str, Any]]
+    ) -> None:
+        """Freeze the inheritance snapshot used by a batch's pipeline run."""
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM decision_inheritances WHERE batch_id=?", (batch_id,)
+            )
+            conn.executemany(
+                """INSERT INTO decision_inheritances(batch_id,source_decision_id,
+                     source_batch_id,pair_key,rec_a_key,rec_b_key,
+                     rec_a_fingerprint,rec_b_fingerprint,decision,submitted_at,
+                     inherited_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                [(batch_id, pin["source_decision_id"], pin["source_batch_id"],
+                  pin["pair_key"], pin["rec_a_key"], pin["rec_b_key"],
+                  pin["rec_a_fingerprint"], pin["rec_b_fingerprint"], pin["decision"],
+                  pin["submitted_at"], inherited_at) for pin in pins],
+            )
+
+    def list_inheritances(self, batch_id: str) -> list[sqlite3.Row]:
+        return self.query(
+            "SELECT * FROM decision_inheritances WHERE batch_id=? "
+            "ORDER BY submitted_at,source_decision_id,pair_key",
             (batch_id,),
         )
