@@ -6,13 +6,31 @@ import io
 import json
 from typing import Any
 
+from .fingerprint import (
+    fingerprint_summary, list_cross_batch_refs, list_fingerprints,
+)
 from .models import record_from_db
 from .storage import Storage
 
 
+def fingerprint_payload(storage: Storage, batch_id: str | None = None) -> dict[str, Any]:
+    return {
+        "batch_id": batch_id,
+        "fingerprints": list_fingerprints(storage, batch_id),
+        "cross_batch_refs": (
+            list_cross_batch_refs(storage, batch_id) if batch_id is not None else []
+        ),
+    }
+
+
 def batch_public(storage: Storage, row: Any, include_dead: bool = False) -> dict[str, Any]:
+    """Batch fields are additive: pre-existing keys keep their shape."""
     payload = dict(row)
     payload["latest_run_id"] = storage.latest_run_id(row["batch_id"])
+    payload["fingerprint_summary"] = fingerprint_summary(storage, row["batch_id"])
+    payload["cross_batch_refs"] = list_cross_batch_refs(
+        storage, row["batch_id"], include_records=include_dead
+    )
     if include_dead:
         payload["dead_letters"] = [
             dict(dead) for dead in storage.list_dead_letters(row["batch_id"])
@@ -24,6 +42,10 @@ def run_public(storage: Storage, row: Any) -> dict[str, Any]:
     payload = dict(row)
     payload["timings"] = json.loads(payload.pop("timings_json"))
     payload["blocking_stats"] = json.loads(payload.pop("blocking_stats_json"))
+    # Cross-batch context is derived live from the index; run rows themselves
+    # are never rewritten by fingerprinting or later batch ingestion.
+    payload["fingerprint_summary"] = fingerprint_summary(storage, row["batch_id"])
+    payload["cross_batch_refs"] = list_cross_batch_refs(storage, row["batch_id"])
     attempt = storage.latest_attempt(row["run_id"])
     count = storage.query_one(
         "SELECT COUNT(*) AS n FROM run_attempts WHERE run_id=?", (row["run_id"],)

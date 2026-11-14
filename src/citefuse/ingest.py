@@ -10,6 +10,10 @@ from pydantic import ValidationError
 
 from .clock import Clock
 from .config import AppConfig
+from .fingerprint import (
+    ensure_all_fingerprints, ensure_fingerprint, has_missing_index_rows,
+    sync_cross_batch_refs,
+)
 from .models import BATCH_ID_RE, RawRecord
 from .normalize import NormalizationError, Normalizer
 from .storage import Storage
@@ -76,12 +80,18 @@ def ingest_jsonl(
     existing = storage.get_batch(chosen_id)
     if existing is not None and existing["input_hash"] == input_hash:
         result = dict(existing)
-        result.update({"created": False, "inserted": 0, "duplicates": 0, "dead_added": 0})
+        result.update({
+            "created": False, "inserted": 0, "duplicates": 0, "dead_added": 0,
+            "fingerprinted": 0, "fingerprint_degraded": 0,
+            "cross_batch_refs_added": 0,
+        })
         return result
 
     normalizer = Normalizer(config.normalization)
     now = clock.now_iso()
     inserted = duplicates = dead_added = 0
+    fingerprinted = degraded = cross_refs = 0
+    touched_fingerprints: set[str] = set()
     physical_lines = 0
     bootstrap = {
         "batch_id": chosen_id,
@@ -126,10 +136,69 @@ def ingest_jsonl(
             "doi": norm["doi"],
             "gold_cluster": raw.gold_cluster,
         }
-        if storage.insert_record(chosen_id, row):
+        if (record_pk := storage.insert_record_pk(chosen_id, row)) is not None:
             inserted += 1
+            # Fingerprinting is strictly additive and never blocks ingestion.
+            try:
+                state = ensure_fingerprint(
+                    storage, clock,
+                    {"record_pk": record_pk, "batch_id": chosen_id,
+                     "source": row["source"], "record_id": row["record_id"]},
+                    norm,
+                )
+                if state["fingerprint"] is not None:
+                    fingerprinted += 1
+                    touched_fingerprints.add(state["fingerprint"])
+                elif state["inserted"]:
+                    degraded += 1
+            except Exception as exc:  # never fail a batch because of the index
+                storage.add_audit_event(
+                    chosen_id, None, "fingerprint_error",
+                    {"source": row["source"], "record_id": row["record_id"],
+                     "error": f"{type(exc).__name__}: {exc}"[:500]},
+                    now,
+                )
         else:
             duplicates += 1
+
+    if inserted:
+        # Lazily index records that predate this feature so an upgraded
+        # database starts matching as soon as the first new batch arrives.
+        # The row-count check keeps steady state O(1); INSERT OR IGNORE on the
+        # per-record path guarantees concurrent ingests stay idempotent.
+        # Any failure here is audited and swallowed: indexing is advisory and
+        # must never reject an otherwise valid batch.
+        try:
+            if has_missing_index_rows(storage):
+                historical = ensure_all_fingerprints(storage, clock)
+                if historical["indexed"]:
+                    # A newly indexed historical record may match anything
+                    # already indexed; re-sync by value (INSERT OR IGNORE).
+                    fingerprints = [row["fingerprint"] for row in storage.query(
+                        """SELECT DISTINCT fingerprint FROM record_fingerprints
+                           WHERE status='indexed' AND fingerprint IS NOT NULL"""
+                    )]
+                    synced = sync_cross_batch_refs(
+                        storage, clock, fingerprints, origin_batch_id=chosen_id
+                    )
+                else:
+                    synced = sync_cross_batch_refs(
+                        storage, clock, touched_fingerprints,
+                        origin_batch_id=chosen_id,
+                    )
+            elif touched_fingerprints:
+                synced = sync_cross_batch_refs(
+                    storage, clock, touched_fingerprints, origin_batch_id=chosen_id
+                )
+            else:
+                synced = {"added": 0}
+            cross_refs = synced["added"]
+        except Exception as exc:
+            storage.add_audit_event(
+                chosen_id, None, "fingerprint_error",
+                {"phase": "post_ingest", "error": f"{type(exc).__name__}: {exc}"[:500]},
+                now,
+            )
 
     valid_count = storage.count_records(chosen_id)
     bad_count = storage.count_dead_letters(chosen_id)
@@ -152,5 +221,8 @@ def ingest_jsonl(
         "inserted": inserted,
         "duplicates": duplicates,
         "dead_added": dead_added,
+        "fingerprinted": fingerprinted,
+        "fingerprint_degraded": degraded,
+        "cross_batch_refs_added": cross_refs,
     })
     return result

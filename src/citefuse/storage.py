@@ -93,6 +93,49 @@ CREATE TABLE IF NOT EXISTS audit_events (
   event_type TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON audit_events(run_id);
+-- Cross-batch document fingerprints. One row per record: record_pk is the
+-- primary key, so concurrent duplicate ingress cannot create a second index
+-- row for the same record. Degraded records keep a row with fingerprint NULL
+-- so lazy backfill does not retry them forever.
+CREATE TABLE IF NOT EXISTS record_fingerprints (
+  record_pk INTEGER PRIMARY KEY REFERENCES records(record_pk) ON DELETE CASCADE,
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  fingerprint TEXT, status TEXT NOT NULL, algorithm TEXT NOT NULL,
+  components_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_value ON record_fingerprints(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_batch ON record_fingerprints(batch_id);
+-- Directional cross-batch references.  The pair is stored canonically
+-- (lower record_pk first) for idempotency; origin_batch_id records which
+-- batch's record was the subject when the reference was first created, so a
+-- historical batch sees later batches as 'incoming'.  Rows are append-only
+-- and never rewrite historical records or runs.
+CREATE TABLE IF NOT EXISTS cross_batch_refs (
+  ref_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  record_pk INTEGER NOT NULL REFERENCES records(record_pk) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL,
+  matched_batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  matched_record_pk INTEGER NOT NULL REFERENCES records(record_pk) ON DELETE CASCADE,
+  origin_batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  details_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(record_pk, matched_record_pk)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_refs_batch ON cross_batch_refs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_cross_refs_matched ON cross_batch_refs(matched_batch_id);
+-- Fingerprint matches rejected by the author given-name guard.  Kept so a
+-- collision is audited once (not once per sync) and is reviewable later.
+CREATE TABLE IF NOT EXISTS fingerprint_collisions (
+  collision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fingerprint TEXT NOT NULL,
+  record_pk INTEGER NOT NULL REFERENCES records(record_pk) ON DELETE CASCADE,
+  matched_batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  matched_record_pk INTEGER NOT NULL REFERENCES records(record_pk) ON DELETE CASCADE,
+  details_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(fingerprint, record_pk, matched_record_pk)
+);
+CREATE INDEX IF NOT EXISTS idx_collisions_record ON fingerprint_collisions(record_pk);
+CREATE INDEX IF NOT EXISTS idx_collisions_matched ON fingerprint_collisions(matched_record_pk);
 """
 
 
@@ -162,6 +205,14 @@ class Storage(RepositoryMixin):
         return self.query("SELECT * FROM batches ORDER BY created_at, batch_id")
 
     def insert_record(self, batch_id: str, row: dict[str, Any]) -> bool:
+        return self.insert_record_pk(batch_id, row) is not None
+
+    def insert_record_pk(self, batch_id: str, row: dict[str, Any]) -> int | None:
+        """Insert one record, returning its primary key when it is new.
+
+        ``INSERT OR IGNORE`` keeps same-batch re-uploading idempotent; None means
+        the (batch_id, source, record_id) row already existed.
+        """
         cursor = self.execute(
             """INSERT OR IGNORE INTO records(batch_id,source,record_id,line_no,
                  raw_json,norm_json,title_norm,authors_norm,venue_norm,year_norm,
@@ -172,7 +223,9 @@ class Storage(RepositoryMixin):
              json_dumps(row["authors"]), row["venue"], row["year"], row["volume"],
              row["issue"], row["pages"], row["doi"], row["gold_cluster"]),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return None
+        return int(cursor.lastrowid)
 
     def list_records(self, batch_id: str) -> list[sqlite3.Row]:
         return self.query(

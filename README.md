@@ -99,10 +99,23 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | `clusters` | `cluster_id`, `member_keys_json`, `golden_json` | 簇成员与字段级金记录。 |
 | `decisions` | `pair_key`, `decision`, `reviewer`, `note`, `submitted_at` | 人工裁定历史；同 pair 以提交时间/自增序号最新者为准。 |
 | `audit_events` | `run_id`, `event_type`, `detail_json`, `created_at` | 复核冲突、运行完成/失败等审计事件。 |
+| `record_fingerprints` | `record_pk`（主键）, `batch_id`, `fingerprint`, `status`, `components_json` | 跨批次文档指纹索引；每记录至多一行，`status=degraded` 表示不参与去重。 |
+| `cross_batch_refs` | 两记录主键、`fingerprint`、`origin_batch_id`、`details_json` | 追加式跨批次交叉引用；不改写历史 records/runs。 |
+| `fingerprint_collisions` | `fingerprint`、两记录主键、`details_json` | 被姓名守卫拒绝的指纹命中，审计一次、可复核。 |
 
 `run_id` 由批次内容哈希、配置哈希和裁定历史确定性派生；`cluster_id` 由批次与排序后的成员 key 派生。相同输入重跑会复用同一个 `run_id`，并重建相同的 pairs/edges/clusters/golden 行。每次调用仍会追加 `run_attempts` 和审计事件。
 
 输入记录还可附带可选的评估字段 `gold_cluster`（fixture 自带）。它只用于 `GET /metrics/report` 与阈值扫描，绝不参与阻塞、打分或聚类。
+
+### 跨批次文档指纹
+
+批次级 `input_hash` 只能识别「整批内容重复」，无法识别「同一实体从不同来源进入不同批次」。为此在 ingest 阶段额外为每条记录计算文档指纹：
+
+- **计算时点**：归一化之后，只取 `title + authors + year` 三个核心字段；标题用全部归一化 token 排序集合，作者用解析后的 `family|given首字母` 键排序去重，年份精确。不包含 `record_pk`、批次号、来源、venue/DOI/raw_json，因此同实体不同来源、不同拼写形态会收敛到同一指纹。
+- **不物理合并**：指纹只写入 `record_fingerprints`，跨批次命中写入 `cross_batch_refs`；历史 `records`、历史批次的 `clusters`/golden 和已完成的 `runs` 均逐字节不变。不一致的同批内重复行仍由原有聚类路径处理。
+- **假阳性控制**：①标题至少 2 个 token、至少 1 位可解析作者、年份为合法整数，否则标记 `degraded`（照常入库、不参与跨批次去重、写 `fingerprint_degraded` 审计）；②作者键只含首字母，因此在写入引用前比较同键的完整 given 名，不同全名（如 John/Jane Smith）判为碰撞：不写引用并记 `fingerprint_collision`；首字母与全名形式（`J. Smith` vs `John Smith`）仍视为兼容；③引用仅为提示，不进入 blocking/scoring/clustering，误判代价是可复核的一条链接，而非错误的簇或金记录。
+- **并发幂等**：`record_fingerprints` 以 `record_pk` 为主键，`cross_batch_refs` 以 `(record_pk, matched_record_pk)` 唯一，全部 `INSERT OR IGNORE`；同一批次并发上传只会各写一行索引。
+- **历史库升级**：新表随启动 DDL 幂等创建且不扫表，旧记录在查询时返回空引用列表而非报错。`POST /fingerprints/backfill` 按需补齐；首次有记录新增的 ingest 也会惰性补齐缺失指纹，使旧记录立即参与匹配。补齐失败逐条审计 `fingerprint_error`，不阻断。
 
 ## 5. API 一览
 
@@ -111,12 +124,15 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=jsonl" -o data/g
 | 方法 | 路径 | 入参 | 出参/说明 |
 |---|---|---|---|
 | GET | `/health` | — | 状态与配置哈希。 |
-| POST | `/batches` | JSONL 原始体，或 `{"jsonl":"...","batch_id":"...","name":"..."}`；可选 `?batch_id=&name=` | 201，批次统计、`inserted`、`duplicates`、`dead_added`。 |
-| GET | `/batches` | — | 批次列表（含最新 run id）。 |
-| GET | `/batches/{id}` | — | 批次统计 + 死信样例；不存在 404。 |
+| POST | `/batches` | JSONL 原始体，或 `{"jsonl":"...","batch_id":"...","name":"..."}`；可选 `?batch_id=&name=` | 201，批次统计、`inserted`、`duplicates`、`dead_added`，以及新增的 `fingerprinted`、`fingerprint_degraded`、`cross_batch_refs_added`。 |
+| GET | `/batches` | — | 批次列表（含最新 run id、`fingerprint_summary`、`cross_batch_refs`）。 |
+| GET | `/batches/{id}` | — | 批次统计 + 死信样例 + 双向跨批次引用；不存在 404。 |
 | DELETE | `/batches/{id}` | — | 级联删除记录、pairs、edges、clusters、runs、decisions、审计；404 若不存在。 |
+| GET | `/fingerprints` | `?batch_id=` | 指纹索引行（值、状态、组件、算法版本）；不触发补齐。 |
+| POST | `/fingerprints/backfill` | `?batch_id=` | 按需补齐缺失指纹并同步交叉引用；可重复调用。 |
+| GET | `/cross-batch-refs` | `?batch_id=` | 该批次的跨批次引用（含 `direction` 与对端记录）。 |
 | POST | `/runs` | `{"batch_id":"..."}` | 201，跑完整管道并返回 run 摘要、阻塞统计、冲突审计。 |
-| GET | `/runs` | `?batch_id=` | 运行列表。 |
+| GET | `/runs` | `?batch_id=` | 运行列表（每个 run 附 `fingerprint_summary` 与跨批次引用，实时派生、不回写 run 行）。 |
 | GET | `/runs/{run_id}` | — | 运行详情、最近一次尝试耗时、审计事件。 |
 | GET | `/review/next` | `?n=10&batch_id=` | 最新 run 中未裁定的灰区 pair，含双记录、总分、分项、策略。 |
 | POST | `/review/decisions` | `{"batch_id","pair_key","decision":"same\|different","reviewer","note"}` | 持久化裁定并**自动重跑**；返回新 run 摘要。 |
@@ -211,6 +227,7 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 时间戳和耗时通过可注入 `Clock` 获取；测试使用 `FixedClock`。所有集合排序显式，JSON 使用排序键。
 - 配置 SHA-256 写入 `runs.config_hash` 和指标报告；报告位于 `data/reports/{run_id}.json` 与 `{run_id}_thresholds.json`。
 - 指标：pairwise TP/FP/FN 基于金标准簇；簇级完全一致率 = 与某个金标准簇成员集合完全相同的预测簇数 / 有金标签的预测簇数。阈值扫描仅复用 `pairs.score`，不重跑归一化或阻塞。
+- 跨批次指纹：同值命中按 `(record_pk, matched_record_pk)` 唯一约束幂等写入，仅供查询与人工复核；不参与 `run_id`、pair、edge、cluster 或 golden 的生成，因此重跑同一批次的结果与是否启用指纹无关。指纹算法版本写入 `record_fingerprints.algorithm`（当前 `cf-fp-v1`）。
 
 ## 8. 已知局限
 
@@ -220,6 +237,8 @@ pair 内记录按 `record_id` 字典序（并列时按 source）排列，pair ke
 - 仅接收 JSONL/HTTP 与 JSONL/CSV 导出，不解析 RIS/BibTeX/EndNote。
 - 金记录字段为归一化后的值；原始值保留在簇成员的 `raw_json` 中。
 - 复核裁定接口同步自动重跑，超大批次时请求耗时随管道耗时增长。
+- 跨批次去重是**文档级提示**而非合并：同一实体仍会留存在各自批次的 records/簇中，跨批次统一靠 `cross_batch_refs` 与 `/fingerprints` 对齐；指纹基于 `title+authors+year`，标题改写幅度过大或年份缺失的记录会降级为不参与跨批次匹配。
+- 指纹与批次内容哈希无关：同一实体在同一批次内重复仍走原有 `(batch_id,source,record_id)` 唯一约束与聚类路径。
 
 ## 9. 测试与验收走查
 
@@ -262,4 +281,28 @@ curl -s "http://127.0.0.1:8321/golden/export?run_id=$RUN&format=csv" -o data/gol
 curl -s -X DELETE 'http://127.0.0.1:8321/batches/DEMO'
 ```
 
+跨批次指纹的最小走查：
+
+```bash
+# 第二批：同实体、不同来源/拼写
+curl -s -X POST 'http://127.0.0.1:8321/batches?batch_id=DEMO2' \
+  -H 'Content-Type: application/x-ndjson' --data-binary @more.jsonl
+
+# 批次详情中的双向交叉引用与索引状态
+curl -s 'http://127.0.0.1:8321/batches/DEMO2' | python -m json.tool | head -80
+curl -s 'http://127.0.0.1:8321/cross-batch-refs?batch_id=DEMO2'
+curl -s 'http://127.0.0.1:8321/fingerprints?batch_id=DEMO2'
+
+# 旧库按需补齐指纹（可重复调用）
+curl -s -X POST 'http://127.0.0.1:8321/fingerprints/backfill'
+```
+
 验收关注点：`pytest` 全绿；fixture 200 条、120 个金标准簇；管道 F1 ≥ 0.90（默认实现为 1.0）；同一批次重复导入 `inserted=0`；同一 run 重跑簇/金记录逐行一致；复核裁定后重跑分裂/合并；阈值扫描与报告落盘；`data/reports/` 和 `data/citefuse.sqlite3` 为运行期产物且已被 `.gitignore` 忽略。
+
+跨批次指纹专项验收（`tests/test_fingerprint.py` 覆盖）：
+
+1. 造两个批次，第二批放与第一批相同实体（换来源、换大小写/全角/作者顺序/年份写法）和全新实体：`GET /batches/{第二批}` 的 `cross_batch_refs` 指向第一批对应记录，第一批详情显示 `direction=incoming`。
+2. 第二批入库前后，第一批的 `records.raw_json`/`norm_json`、`clusters` 两列与 `golden_json`、以及第一批已完成 `runs` 行逐字节不变。
+3. 第二批跑出的簇中，同实体记录共享与第一批同实体簇相同的指纹，可据此跨批次对齐分组。
+4. 同一批次并发上传多次：`record_fingerprints` 每记录一行、`cross_batch_refs` 无重复。
+5. 用不含指纹表的旧库启动：`/batches`、`/runs` 不报错且旧记录引用为空；`POST /fingerprints/backfill` 补齐后旧记录立即参与跨批次去重。

@@ -14,11 +14,13 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from .api_views import (
-    batch_public, cluster_detail, cluster_summaries, export_golden, run_public,
+    batch_public, cluster_detail, cluster_summaries, export_golden, fingerprint_payload,
+    run_public,
 )
 from .audit import run_events
 from .clock import Clock, SystemClock
 from .config import AppConfig, PROJECT_ROOT, load_config
+from .fingerprint import backfill_fingerprints, list_cross_batch_refs
 from .ingest import IngestError, ingest_jsonl
 from .metrics import MetricsError, build_report, scan_thresholds
 from .models import DecisionRequest, RunRequest
@@ -132,6 +134,29 @@ def create_app(
             for suffix in (".json", "_thresholds.json"):
                 (reports_dir / f"{run_id}{suffix}").unlink(missing_ok=True)
         return {"deleted": True, "batch_id": batch_id, "runs_removed": len(run_ids)}
+
+    @app.get("/fingerprints")
+    def get_fingerprints(batch_id: str | None = Query(default=None)) -> dict[str, Any]:
+        if batch_id is not None and storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        return fingerprint_payload(storage, batch_id)
+
+    @app.post("/fingerprints/backfill")
+    def post_fingerprint_backfill(
+        batch_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        if batch_id is not None and storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        return backfill_fingerprints(storage, active_clock, batch_id)
+
+    @app.get("/cross-batch-refs")
+    def get_cross_batch_refs(batch_id: str) -> dict[str, Any]:
+        if storage.get_batch(batch_id) is None:
+            raise HTTPException(404, f"batch {batch_id!r} not found")
+        return {
+            "batch_id": batch_id,
+            "cross_batch_refs": list_cross_batch_refs(storage, batch_id),
+        }
 
     @app.post("/runs", status_code=201)
     def create_run(body: RunRequest) -> dict[str, Any]:
